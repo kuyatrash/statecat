@@ -4,10 +4,7 @@ StateCat keeps one living project state in one plain, local file,
 so a new agent session can start from what is already decided
 instead of reconstructing it from scattered notes and old chats.
 
-Mascot: Tsuki, an all-black cat with glowing yellow eyes. Tsuki is
-the mascot only; no feature is modelled on cat behaviour. Normal
-CLI output is banner-free so agents can parse it; Tsuki appears
-only in `--help` and documentation.
+Normal CLI output is banner-free so agents can parse it.
 
 StateCat is local only. It makes no network calls, has no account,
 no cloud, no sync, and no installer. It is one Python script
