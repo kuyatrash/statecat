@@ -1,0 +1,6 @@
+#!/bin/sh
+# StateCat launcher (optional, Unix only).
+# Forwards all arguments to statecat.py in the same directory as this
+# launcher, so `./statecat check` works without typing python3.
+# Windows users: keep using `python3 statecat.py <command>`.
+exec python3 "$(dirname "$0")/statecat.py" "$@"

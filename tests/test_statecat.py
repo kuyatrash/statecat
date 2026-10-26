@@ -382,6 +382,152 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("Last ID used: #3", state)
         self.assertIn("- #1", archive)
 
+    # --- Fix round 2026-10-26 (owner code review) ---
+    def test_bare_number_id_works(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Bare id item")
+        result = run_cli(self.dir, "move", "1", "Waiting on human")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(self.dir, "update", "1", "Bare id item, revised")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_docs_use_bare_ids_and_full_pointer(self):
+        for filename in ("README.md", "SKILL.md", "AGENTS-pointer.md"):
+            text = read_text(os.path.join(ROOT, filename))
+            self.assertIn("python3 statecat.py check", text, filename)
+            self.assertNotIn("run statecat check", text, filename)
+        readme = read_text(os.path.join(ROOT, "README.md"))
+        self.assertIn("move 2 ", readme)
+        self.assertNotIn("python3 statecat.py move #2", readme)
+        self.assertNotIn("python3 statecat.py move #9", readme)
+        self.assertIn("unquoted `#` starts a comment", readme)
+        help_text = subprocess.run(
+            [sys.executable, CLI, "move", "--help"], capture_output=True, text=True
+        ).stdout
+        self.assertIn("e.g. 12", help_text)
+        self.assertNotIn("e.g. #12", help_text)
+
+    def test_launcher_forwards_to_script(self):
+        launcher_src = os.path.join(ROOT, "statecat")
+        self.assertTrue(os.path.isfile(launcher_src))
+        self.assertTrue(os.access(launcher_src, os.X_OK))
+        shutil.copy(CLI, self.dir)
+        shutil.copy(launcher_src, self.dir)
+        result = subprocess.run(
+            [os.path.join(self.dir, "statecat"), "init", "Launcher Project"],
+            cwd=self.dir, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(
+            [os.path.join(self.dir, "statecat"), "check"],
+            cwd=self.dir, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("clean", result.stdout)
+
+    def test_subfolder_walkup_and_init_refusal(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Root item")
+        deep = os.path.join(self.dir, "sub", "deep")
+        os.makedirs(deep)
+        result = run_cli(deep, "add", "Open", "From subfolder")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(deep, "STATE.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "sub", "STATE.md")))
+        state = read_text(state_path(self.dir))
+        self.assertIn("From subfolder", state)
+        self.assertTrue(os.path.isdir(os.path.join(self.dir, ".statecat", "backups")))
+        result = run_cli(deep, "show")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("From subfolder", result.stdout)
+        result = run_cli(deep, "init", "Second")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("parent project root", result.stderr)
+
+    def test_no_root_error_is_clear_and_creates_nothing(self):
+        result = run_cli(self.dir, "show")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no STATE.md found", result.stderr)
+        self.assertIn("project root", result.stderr)
+        self.assertFalse(os.path.exists(state_path(self.dir)))
+
+    def test_restore_with_missing_state_file(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Keep me")
+        os.remove(state_path(self.dir))
+        result = run_cli(self.dir, "restore", "--list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.exists(state_path(self.dir)))
+        self.assertTrue(os.path.exists(archive_path(self.dir)))
+        state = read_text(state_path(self.dir))
+        self.assertNotIn("Keep me", state)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_restore_with_no_snapshots_fails_cleanly(self):
+        result = run_cli(self.dir, "restore")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(os.path.exists(state_path(self.dir)))
+
+    def test_missing_heading_is_structural_and_not_recreated(self):
+        self.copy_fixture()
+        text = read_text(state_path(self.dir))
+        text = text.replace("## Parked\n", "", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing bucket heading", result.stdout)
+        self.assertIn("Parked", result.stdout)
+        result = run_cli(self.dir, "add", "Open", "Must not be added")
+        self.assertNotEqual(result.returncode, 0)
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("## Parked", read_text(state_path(self.dir)))
+
+    def test_newline_text_rejected_without_backup(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Good item")
+        for args in (("add", "Open", "bad\nline"), ("update", "1", "bad\rline")):
+            result = run_cli(self.dir, *args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn("single line", result.stderr)
+        # No snapshot was taken for the rejected add (only the good add's).
+        result = run_cli(self.dir, "restore", "--list")
+        snapshots = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(snapshots), 1)
+        state = read_text(state_path(self.dir))
+        self.assertNotIn("bad", state)
+
+    def test_safety_snapshots_count_toward_pruning(self):
+        self.init_project()
+        for i in range(5):
+            run_cli(self.dir, "add", "Open", "Item %d" % i)
+        for _ in range(15):
+            run_cli(self.dir, "restore")
+        result = run_cli(self.dir, "restore", "--list")
+        snapshots = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertLessEqual(len(snapshots), 20)
+        self.assertTrue(any(line.strip().endswith("pre-write") for line in snapshots))
+        # Default restore still works after pruning.
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_blank_line_before_next_heading(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Middle bucket item")
+        text = read_text(state_path(self.dir))
+        self.assertTrue(text.endswith("\n"))
+        lines = text.splitlines()
+        idx = lines.index("- #1 [%s] Middle bucket item" % TODAY)
+        self.assertEqual(lines[idx + 1], "")
+        self.assertEqual(lines[idx + 2], "## Waiting on human")
+
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)

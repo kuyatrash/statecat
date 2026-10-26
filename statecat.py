@@ -302,6 +302,11 @@ def structural_problems(state, archive):
     Missing ID and missing date are warnings, not structural problems.
     """
     problems = []
+    for bucket in BUCKETS:
+        if state.bucket_range(bucket)[0] is None:
+            problems.append(
+                "missing bucket heading '## %s' in %s" % (bucket, STATE)
+            )
     for index, heading in state.unknown_headings:
         problems.append(
             "unknown bucket %r on line %d of %s" % (heading, index + 1, STATE)
@@ -341,7 +346,7 @@ def structural_problems(state, archive):
     return problems
 
 
-def warnings_for(state, archive):
+def warnings_for(state, archive, directory=None):
     """Return a list of warning strings (never blocking)."""
     warnings = []
     if state.last_id is None:
@@ -365,7 +370,7 @@ def warnings_for(state, archive):
             )
     # Size budget.
     try:
-        size = os.path.getsize(os.path.join(os.getcwd(), STATE))
+        size = os.path.getsize(os.path.join(directory or os.getcwd(), STATE))
     except OSError:
         size = 0
     line_count = len(state.lines)
@@ -460,13 +465,29 @@ def list_snapshots(directory):
 
 
 def prune_snapshots(directory):
-    """Keep the last 20 pre-write snapshots (safety snapshots are separate)."""
+    """Keep at most 20 snapshots in total, counting safety snapshots.
+
+    The most recent pre-write snapshot is never pruned, so the
+    restore default always remains available.
+    """
     root = backup_root(directory)
     if not os.path.isdir(root):
         return
-    pre_write = [item for item in list_snapshots(directory) if item[1] == "pre-write"]
-    for _name, _kind, path in pre_write[:-BACKUPS_KEPT]:
+    snapshots = list_snapshots(directory)
+    if len(snapshots) <= BACKUPS_KEPT:
+        return
+    pre_write = [item for item in snapshots if item[1] == "pre-write"]
+    latest_pre = pre_write[-1] if pre_write else None
+    excess = len(snapshots) - BACKUPS_KEPT
+    deleted = 0
+    by_time = sorted(snapshots, key=lambda item: os.path.getmtime(item[2]))
+    for name, kind, path in by_time:
+        if deleted >= excess:
+            break
+        if latest_pre is not None and (name, kind, path) == latest_pre:
+            continue
         shutil.rmtree(path, ignore_errors=True)
+        deleted += 1
 
 
 def take_snapshot(directory, kind):
@@ -484,8 +505,7 @@ def take_snapshot(directory, kind):
         if os.path.exists(source):
             with open(source, "rb") as src, open(os.path.join(path, filename), "wb") as dst:
                 shutil.copyfileobj(src, dst)
-    if kind == "pre-write":
-        prune_snapshots(directory)
+    prune_snapshots(directory)
     return name
 
 
@@ -498,6 +518,47 @@ def validate_or_fail(state, archive):
         sys.exit(1)
 
 
+def find_project_root(start=None):
+    """Walk up from start (default cwd) until STATE.md is found."""
+    directory = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(directory, STATE)):
+            return directory
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+
+def find_restore_root(start=None):
+    """Walk up until STATE.md or .statecat/backups is found."""
+    directory = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(directory, STATE)) or os.path.isdir(
+            os.path.join(directory, BACKUP_ROOT)
+        ):
+            return directory
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+
+def require_root():
+    """Return the project root for this command, or exit cleanly."""
+    root = find_project_root()
+    if root is None:
+        sys.stderr.write(
+            "error: no %s found in this folder or any parent folder.\n" % STATE
+        )
+        sys.stderr.write(
+            "Run statecat init in your project root; "
+            "do not create a second %s in a subfolder.\n" % STATE
+        )
+        sys.exit(1)
+    return root
+
+
 def require_state(directory):
     state_path = os.path.join(directory, STATE)
     if not os.path.exists(state_path):
@@ -505,6 +566,16 @@ def require_state(directory):
     archive_path = os.path.join(directory, ARCHIVE)
     if not os.path.exists(archive_path):
         fail_cleanly("%s not found in this folder. Run statecat init first." % ARCHIVE)
+
+
+def reject_newlines(text, label="item text"):
+    """Reject \n / \r in item text before any snapshot or write."""
+    if text is not None and ("\n" in text or "\r" in text):
+        sys.stderr.write(
+            "error: %s must be a single line; newlines are not allowed.\n" % label
+        )
+        sys.stderr.write("No files were changed and no backup was taken.\n")
+        sys.exit(1)
 
 
 def template_state(project):
@@ -545,6 +616,14 @@ def lines_from_contents(contents, ending="\n"):
 
 def cmd_init(args):
     directory = os.getcwd()
+    parent_root = find_project_root(os.path.dirname(os.path.abspath(directory)))
+    if parent_root is not None:
+        sys.stderr.write(
+            "error: %s already exists in parent project root %s; "
+            "refusing to create a second state file. "
+            "Use that project root instead.\n" % (STATE, parent_root)
+        )
+        return 1
     state_path = os.path.join(directory, STATE)
     archive_path = os.path.join(directory, ARCHIVE)
     if os.path.exists(state_path) or os.path.exists(archive_path):
@@ -560,8 +639,7 @@ def cmd_init(args):
 
 
 def cmd_show(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, _archive = read_state_and_archive(directory)
     if args.bucket:
         bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
@@ -580,28 +658,40 @@ def cmd_show(args):
     return 0
 
 
+def insert_line_before_heading(state, index, line_content):
+    """Insert a line at index, leaving a blank line before a heading.
+
+    Only the inserted lines are new; untouched lines are not
+    reformatted, re-wrapped, or reordered.
+    """
+    ending = state.dominant_ending()
+    state.lines.insert(index, [line_content, ending])
+    if index + 1 < len(state.lines) and state.lines[index + 1][0].startswith("## "):
+        if state.lines[index][0] != "":
+            state.lines.insert(index + 1, ["", ending])
+    return index
+
+
 def insert_into_bucket(state, bucket, line_content):
     """Insert a line into a bucket section, just before the next heading."""
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    ending = state.dominant_ending()
-    # Insert at end of the section, skipping a trailing blank line is
-    # not needed: appending before the next heading keeps the file
-    # readable and leaves every other line untouched.
-    state.lines.insert(end, [line_content, ending])
+    insert_line_before_heading(state, end, line_content)
     return end
 
 
 def cmd_add(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     validate_or_fail(state, archive)
     bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
     if bucket is None:
         sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
         return 1
+    reject_newlines(args.text, "item text")
+    if args.because:
+        reject_newlines(args.because, "because text")
     text = args.text
     if args.because:
         text = "%s, because %s" % (text, args.because)
@@ -638,13 +728,14 @@ def _move_impl(directory, state, archive, item, bucket):
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    state.lines.insert(end, [rendered, ending or state.dominant_ending()])
+    insert_line_before_heading(state, end, rendered)
+    # insert_line_before_heading used the dominant ending; preserve the
+    # moved item's own ending if it differed.
     atomic_write(os.path.join(directory, STATE), state.lines)
 
 
 def cmd_move_real(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     validate_or_fail(state, archive)
     item_id = parse_id(args.item)
@@ -668,8 +759,7 @@ def cmd_move_real(args):
 
 
 def cmd_update(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     validate_or_fail(state, archive)
     item_id = parse_id(args.item)
@@ -680,6 +770,7 @@ def cmd_update(args):
     if item.bucket == "Parked" and not args.owner_approved:
         sys.stderr.write("error: #%d is Parked; updating a parked item requires --owner-approved.\n" % item_id)
         return 1
+    reject_newlines(args.text, "item text")
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
@@ -699,12 +790,11 @@ def append_to_archive(archive, line_content, ending):
         # Archive template uses "## Archived"; fall back to end of file.
         archive.lines.append([line_content, ending])
         return
-    archive.lines.insert(end, [line_content, ending])
+    insert_line_before_heading(archive, end, line_content)
 
 
 def cmd_supersede(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     validate_or_fail(state, archive)
     item_id = parse_id(args.item)
@@ -715,6 +805,9 @@ def cmd_supersede(args):
     if item.bucket != "Decided":
         sys.stderr.write("error: supersede only applies to Decided items; #%d is in %s\n" % (item_id, item.bucket))
         return 1
+    reject_newlines(args.text, "item text")
+    if args.because:
+        reject_newlines(args.because, "because text")
     new_id = state.next_id(archive)
     old_content = item.content
     old_ending = item.ending
@@ -739,8 +832,7 @@ def cmd_supersede(args):
 
 
 def cmd_archive(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     validate_or_fail(state, archive)
     item_id = parse_id(args.item)
@@ -767,11 +859,10 @@ def cmd_archive(args):
 
 
 def cmd_check(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = require_root()
     state, archive = read_state_and_archive(directory)
     problems = structural_problems(state, archive)
-    warnings = warnings_for(state, archive)
+    warnings = warnings_for(state, archive, directory)
     for problem in problems:
         print("problem: %s" % problem)
     for warning in warnings:
@@ -817,8 +908,16 @@ def cmd_check(args):
 
 
 def cmd_restore(args):
-    directory = os.getcwd()
-    require_state(directory)
+    directory = find_restore_root()
+    if directory is None:
+        if args.list:
+            print("no snapshots")
+            return 0
+        sys.stderr.write(
+            "error: no %s or .statecat/backups found in this folder or any "
+            "parent folder; no snapshots to restore.\n" % STATE
+        )
+        return 1
     snapshots = list_snapshots(directory)
     if args.list:
         if not snapshots:
@@ -885,25 +984,25 @@ def build_parser():
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("move", help="Move an item to another bucket by ID")
-    p.add_argument("item", help="Item ID, e.g. #12")
+    p.add_argument("item", help="Item ID, e.g. 12")
     p.add_argument("bucket", help="Target bucket name")
     p.add_argument("--owner-approved", action="store_true", help="Required to move out of Parked")
     p.set_defaults(func=cmd_move_real)
 
     p = sub.add_parser("update", help="Replace an item's wording by ID")
-    p.add_argument("item", help="Item ID, e.g. #12")
+    p.add_argument("item", help="Item ID, e.g. 12")
     p.add_argument("text", help="New wording")
     p.add_argument("--owner-approved", action="store_true", help="Required for a parked item")
     p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("supersede", help="Replace a Decided item with a new ID, archiving the old one")
-    p.add_argument("item", help="Decided item ID, e.g. #3")
+    p.add_argument("item", help="Decided item ID, e.g. 3")
     p.add_argument("text", help="Replacement wording")
     p.add_argument("--because", help="Rationale, appended as ', because ...'")
     p.set_defaults(func=cmd_supersede)
 
     p = sub.add_parser("archive", help="Move an item to STATE-ARCHIVE.md by ID")
-    p.add_argument("item", help="Item ID, e.g. #12")
+    p.add_argument("item", help="Item ID, e.g. 12")
     p.add_argument("--owner-approved", action="store_true", help="Required for a parked item")
     p.set_defaults(func=cmd_archive)
 
