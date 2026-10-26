@@ -32,10 +32,14 @@ Parked. `STATE-ARCHIVE.md` holds completed and superseded items
 and is not part of the one-read load.
 
 Add the pointer line to your project's agent instructions file
-(see `AGENTS-pointer.md`):
+(see `AGENTS-pointer.md`). If `statecat.py` lives somewhere other
+than your project root, use that path instead, for example
+`python3 ~/workspace/statecat/statecat.py check`. If you copied
+`statecat.py` and the optional `statecat` launcher into your
+project root, `./statecat check` also works on Unix:
 
 ```text
-Read STATE.md first, then run statecat check, before asking about or working on this project.
+Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
 ```
 
 ## Everyday commands
@@ -45,9 +49,9 @@ python3 statecat.py show
 python3 statecat.py show Open
 python3 statecat.py add Open "Bake the test batch"
 python3 statecat.py add Decided "Sell at the Saturday market" --because "foot traffic is highest there"
-python3 statecat.py move #2 "Waiting on human"
-python3 statecat.py update #2 "Bake the test batch on Friday"
-python3 statecat.py archive #2
+python3 statecat.py move 2 "Waiting on human"
+python3 statecat.py update 2 "Bake the test batch on Friday"
+python3 statecat.py archive 2
 python3 statecat.py check
 python3 statecat.py restore --list
 python3 statecat.py restore
@@ -58,10 +62,35 @@ global counter stored in the "Last ID used" line. An ID never
 changes and is never reused. Commands take the ID, not the text,
 so editing wording does not break identity.
 
+Shell quoting rule: in bash, an unquoted `#` starts a comment, so
+`move #2 Open` would silently drop the ID. Use a bare number
+(`move 2 Open`) or quote the ID (`move "#2" Open`). The code
+accepts both `2` and `#2`. Item text must be a single line: text
+containing a newline or carriage return is rejected with no write
+and no backup taken.
+
+## Optional launcher (Unix)
+
+The repo ships a small executable file named `statecat` that
+forwards its arguments to `statecat.py` in the same directory, so
+`./statecat check` works when both files are together. It is
+optional: `python3 statecat.py <command>` always works, including
+on Windows, and is the form used in this guide.
+
+## Working from a subfolder
+
+Commands other than `init` walk up parent folders to find
+`STATE.md`, like git does, and operate on that project root
+(including its `.statecat/backups/`). If no `STATE.md` is found
+in this folder or any parent folder, the command fails with a
+clear error telling you to run `init` in your project root, not
+to create a second state file in the subfolder. `init` likewise
+refuses if a `STATE.md` already exists in a parent folder.
+
 To replace a decision, use `supersede`, not `update`:
 
 ```sh
-python3 statecat.py supersede #3 "Use local Markdown state files"
+python3 statecat.py supersede 3 "Use local Markdown state files"
 ```
 
 The replacement gets a new ID noting "supersedes #3", and the old
@@ -94,7 +123,7 @@ and never uses it to flag or clear staleness. The agent may run
 
 If a hand edit broke the file structure, the CLI fails cleanly:
 it writes nothing, names the problem line, and tells you to fix
-it or run `statecat restore`.
+it or run `python3 statecat.py restore`.
 
 The CLI never reformats lines it is not changing, so your hand
 edits survive. Files are opened with `newline=""`, so line
@@ -109,9 +138,9 @@ Moving an item out of Parked, archiving a parked item, or
 updating a parked item requires `--owner-approved`:
 
 ```sh
-python3 statecat.py move #9 Open --owner-approved
-python3 statecat.py archive #9 --owner-approved
-python3 statecat.py update #9 "New wording" --owner-approved
+python3 statecat.py move 9 Open --owner-approved
+python3 statecat.py archive 9 --owner-approved
+python3 statecat.py update 9 "New wording" --owner-approved
 ```
 
 Without the flag, those commands are refused and nothing changes.
@@ -122,7 +151,7 @@ wording.
 
 Every write takes a paired snapshot of both `STATE.md` and
 `STATE-ARCHIVE.md` first, kept in `.statecat/backups/` (last 20
-pre-write snapshots). Two-file writes (supersede, archive) write
+snapshots in total, safety snapshots included). Two-file writes (supersede, archive) write
 the archive first, then `STATE.md`, each file atomically, so a
 crash never leaves a half-written file.
 
