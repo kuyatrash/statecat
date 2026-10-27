@@ -22,6 +22,11 @@ python3 statecat.py init "My Project"
 This creates `STATE.md`, `STATE-ARCHIVE.md`, and
 `.statecat/backups/`. It refuses to overwrite existing files.
 
+On Windows, `python3` often is not on PATH; use `py` or `python`
+instead, for example `py statecat.py check`. On Unix, if
+`./statecat check` gives permission denied on a fresh clone, run
+`chmod +x statecat` once, then try again.
+
 `STATE.md` has a short About header (what the project is, its
 purpose, its key paths, and a "Last ID used" line) and five
 buckets: Decided, Open, Waiting on human, Waiting on others, and
@@ -72,7 +77,9 @@ The repo ships a small executable file named `statecat` that
 forwards its arguments to `statecat.py` in the same directory, so
 `./statecat check` works when both files are together. It is
 optional: `python3 statecat.py <command>` always works, including
-on Windows, and is the form used in this guide.
+on Windows, and is the form used in this guide. The launcher must
+be executable in git (mode 100755); if a fresh clone gives
+permission denied, run `chmod +x statecat` once.
 
 ## Working from a subfolder
 
@@ -121,6 +128,21 @@ and never uses it to flag or clear staleness. The agent may run
 If a hand edit broke the file structure, the CLI fails cleanly:
 it writes nothing, names the problem line, and tells you to fix
 it or run `python3 statecat.py restore`.
+
+Wrapping an item across lines is safe only if the continuation
+lines are indented and immediately follow the item line, with no
+blank line in between. Those continuations move, archive, and
+supersede with the item, as one block. An indented line anywhere
+else is an orphan, and check reports it as a structural problem,
+so it cannot silently strand text in the old bucket.
+
+If the "Last ID used" counter falls behind the highest ID in
+use, check warns about it, and `check --fix` raises the counter
+to that highest ID. If `STATE-ARCHIVE.md` is missing, or has no
+"## Archived" heading, check reports a structural problem and
+write commands refuse, instead of silently recreating a
+headerless archive file. Restore a snapshot containing the
+archive file, or recreate it from `templates/STATE-ARCHIVE.md`.
 
 The CLI never reformats lines it is not changing, so your hand
 edits survive. Files are opened with `newline=""`, so line

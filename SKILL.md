@@ -24,7 +24,8 @@ advisory and may not fire.
 2. Run `python3 statecat.py check` at session start, where the CLI is available,
    and report its warnings once in that session. That report counts
    as the one allowed mention of a stale Waiting on human item for
-   the session (see "Waiting is not nagging" below).
+   the session (see "Waiting is not nagging" below). On Windows,
+   `python3` often is not on PATH; use `py` or `python` instead.
 3. Summarise open work and human-owned moves only when that helps
    the conversation.
 4. The moment a decision changes, update the file before moving on.

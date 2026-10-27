@@ -37,6 +37,11 @@ def read_text(path):
         return handle.read()
 
 
+def read_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
 def read_lines(path):
     with open(path, "r", encoding="utf-8", newline="") as handle:
         return handle.readlines()
@@ -209,13 +214,13 @@ class StateCatTest(unittest.TestCase):
     def test_hand_broken_file_fails_cleanly_no_write(self):
         self.init_project()
         run_cli(self.dir, "add", "Open", "Keep me")
-        before = open(state_path(self.dir), "rb").read()
+        before = read_bytes(state_path(self.dir))
         with open(state_path(self.dir), "a", encoding="utf-8", newline="") as handle:
             handle.write("\n## Mystery\n- #99 [2026-10-26] Broken bucket item\n")
         result = run_cli(self.dir, "add", "Open", "Should not be added")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Mystery", result.stderr)
-        after = open(state_path(self.dir), "rb").read()
+        after = read_bytes(state_path(self.dir))
         # Only the hand edit itself is present; the failed add wrote nothing.
         self.assertNotIn(b"Should not be added", after)
         self.assertEqual(after, before + b"\n## Mystery\n- #99 [2026-10-26] Broken bucket item\n")
@@ -254,12 +259,12 @@ class StateCatTest(unittest.TestCase):
     # 11. Parked temptation: move/archive/update refused without the flag
     def test_parked_temptation(self):
         self.copy_fixture()
-        before = open(state_path(self.dir), "rb").read()
+        before = read_bytes(state_path(self.dir))
         for args in (("move", "#9", "Open"), ("archive", "#9"), ("update", "#9", "Sneaky wording")):
             result = run_cli(self.dir, *args)
             self.assertNotEqual(result.returncode, 0, args)
             self.assertIn("owner-approved", result.stderr)
-        self.assertEqual(open(state_path(self.dir), "rb").read(), before)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
         result = run_cli(self.dir, "move", "#9", "Open", "--owner-approved")
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -307,11 +312,11 @@ class StateCatTest(unittest.TestCase):
         run_cli(self.dir, "add", "Open", "Item A")
         run_cli(self.dir, "add", "Open", "Item B")
         run_cli(self.dir, "restore")
-        after_first = open(state_path(self.dir), "rb").read()
+        after_first = read_bytes(state_path(self.dir))
         self.assertNotIn(b"Item B", after_first)
         self.assertIn(b"Item A", after_first)
         run_cli(self.dir, "restore")
-        after_second = open(state_path(self.dir), "rb").read()
+        after_second = read_bytes(state_path(self.dir))
         self.assertEqual(after_first, after_second)
         self.assertNotIn(b"Item B", after_second)
 
@@ -526,6 +531,117 @@ class StateCatTest(unittest.TestCase):
         idx = lines.index("- #1 [%s] Middle bucket item" % TODAY)
         self.assertEqual(lines[idx + 1], "")
         self.assertEqual(lines[idx + 2], "## Waiting on human")
+
+    # --- Fix round 2026-10-26 (second-agent review) ---
+    def _wrap_first_item(self):
+        text = read_text(state_path(self.dir))
+        text = text.replace(
+            "- #1 [%s] Wrapped item first line" % TODAY,
+            "- #1 [%s] Wrapped item first line\n    wrapped continuation" % TODAY,
+            1,
+        )
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+
+    def test_wrapped_item_archives_as_one_block(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Wrapped item first line")
+        run_cli(self.dir, "add", "Open", "Other item")
+        self._wrap_first_item()
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = run_cli(self.dir, "archive", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("wrapped continuation", read_text(archive_path(self.dir)))
+        self.assertNotIn("wrapped continuation", read_text(state_path(self.dir)))
+
+    def test_wrapped_item_moves_as_one_block(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Wrapped item first line")
+        self._wrap_first_item()
+        result = run_cli(self.dir, "move", "1", "Waiting on human")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = read_text(state_path(self.dir))
+        waiting = state.split("## Waiting on human")[1].split("## Waiting on others")[0]
+        self.assertIn("wrapped continuation", waiting)
+        self.assertNotIn("wrapped continuation", state.split("## Open")[1].split("## Waiting on human")[0])
+
+    def test_wrapped_item_update_keeps_continuation(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Wrapped item first line")
+        self._wrap_first_item()
+        result = run_cli(self.dir, "update", "1", "Wrapped item revised")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = read_text(state_path(self.dir))
+        self.assertIn("Wrapped item revised", state)
+        self.assertIn("wrapped continuation", state)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_orphan_indented_line_is_structural(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        text = read_text(state_path(self.dir))
+        text = text.replace("## Parked\n", "## Parked\n\n    orphan indented line\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("orphan indented line", result.stdout)
+
+    def test_drifted_id_counter_warns_and_fix_raises(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        text = read_text(state_path(self.dir))
+        text = text.replace("Last ID used: #1", "Last ID used: #0", 1)
+        text = text.replace("- #1 ", "- #50 ", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("behind the highest ID in use #50", result.stdout)
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Last ID used to #50", result.stdout)
+        self.assertIn("Last ID used: #50", read_text(state_path(self.dir)))
+        result = run_cli(self.dir, "check")
+        self.assertIn("clean", result.stdout)
+
+    def test_missing_archive_is_structural_and_not_recreated_headerless(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        os.remove(archive_path(self.dir))
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing file", result.stdout)
+        self.assertIn("STATE-ARCHIVE.md", result.stdout)
+        result = run_cli(self.dir, "archive", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(os.path.exists(archive_path(self.dir)))
+
+    def test_missing_archive_heading_is_structural(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        text = read_text(archive_path(self.dir))
+        text = text.replace("## Archived\n", "", 1)
+        with open(archive_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("## Archived", result.stdout)
+
+    def test_require_state_is_removed(self):
+        cli_text = read_text(CLI)
+        self.assertNotIn("def require_state", cli_text)
+        self.assertNotIn("require_state(", cli_text)
+
+    def test_windows_py_note_and_gitignore(self):
+        readme = read_text(os.path.join(ROOT, "README.md"))
+        skill = read_text(os.path.join(ROOT, "SKILL.md"))
+        self.assertIn("py statecat.py", readme)
+        self.assertIn("py", skill)
+        gitignore = read_text(os.path.join(ROOT, ".gitignore"))
+        self.assertIn("__pycache__/", gitignore)
 
 
 

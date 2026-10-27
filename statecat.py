@@ -144,6 +144,7 @@ class Item:
         self.item_date = None
         self.starred = False
         self.text = ""
+        self.continuation_indices = []
         self.parse()
 
     def parse(self):
@@ -194,6 +195,7 @@ class StateFile:
         self.last_id = None
         self.last_id_index = None
         self.unknown_headings = []  # list of (line_index, heading)
+        self.orphan_lines = []  # list of (line_index, content)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", newline="") as handle:
                 raw = handle.readlines()
@@ -203,6 +205,7 @@ class StateFile:
 
     def _parse(self):
         bucket = None
+        last_item = None
         for index, (content, _ending) in enumerate(self.lines):
             if content.startswith("> Last ID used:"):
                 value = parse_id(content.split(":", 1)[1])
@@ -220,9 +223,31 @@ class StateFile:
                 else:
                     bucket = None
                     self.unknown_headings.append((index, heading))
+                last_item = None
                 continue
             if content.startswith("- ") and bucket is not None:
-                self.items.append(Item(index, content, self.lines[index][1], bucket))
+                item = Item(index, content, self.lines[index][1], bucket)
+                self.items.append(item)
+                last_item = item
+                continue
+            if content.startswith((" ", "\t")) and bucket is not None:
+                # An indented line immediately after an item (or after
+                # that item's continuations) is part of that item, so
+                # a hand-wrapped item moves and archives as one block.
+                # Any other indented line is an orphan: it is not part
+                # of an item, and check must flag it instead of
+                # silently ignoring it.
+                if (
+                    last_item is not None
+                    and index
+                    == last_item.line_index + len(last_item.continuation_indices) + 1
+                ):
+                    last_item.continuation_indices.append(index)
+                else:
+                    self.orphan_lines.append((index, content))
+                    last_item = None
+                continue
+            last_item = None
 
     def all_ids(self):
         return [item.item_id for item in self.items if item.item_id is not None]
@@ -299,6 +324,8 @@ def structural_problems(state, archive):
     Missing ID and missing date are warnings, not structural problems.
     """
     problems = []
+    if not os.path.exists(state.path):
+        problems.append("missing file '%s'" % STATE)
     for bucket in BUCKETS:
         if state.bucket_range(bucket)[0] is None:
             problems.append(
@@ -307,6 +334,27 @@ def structural_problems(state, archive):
     for index, heading in state.unknown_headings:
         problems.append(
             "unknown bucket %r on line %d of %s" % (heading, index + 1, STATE)
+        )
+    for index, _content in state.orphan_lines:
+        problems.append(
+            "orphan indented line %d in %s is not part of an item; "
+            "join it to the item above or remove the indent"
+            % (index + 1, STATE)
+        )
+    if not os.path.exists(archive.path):
+        problems.append(
+            "missing file '%s'; restore a snapshot containing it, "
+            "or recreate it from templates/%s" % (ARCHIVE, ARCHIVE)
+        )
+    elif archive.bucket_range("Archived")[0] is None:
+        problems.append(
+            "missing bucket heading '## Archived' in %s" % ARCHIVE
+        )
+    for index, _content in archive.orphan_lines:
+        problems.append(
+            "orphan indented line %d in %s is not part of an item; "
+            "join it to the item above or remove the indent"
+            % (index + 1, ARCHIVE)
         )
     # Duplicate IDs: within a file, or across both files.
     locations = {}  # id -> list of (file, bucket, text)
@@ -348,6 +396,17 @@ def warnings_for(state, archive, directory=None):
     warnings = []
     if state.last_id is None:
         warnings.append("warning: Last ID used line is missing in %s" % STATE)
+    else:
+        highest = 0
+        for parsed in (state, archive):
+            for item_id in parsed.all_ids():
+                if item_id > highest:
+                    highest = item_id
+        if highest > state.last_id:
+            warnings.append(
+                "warning: Last ID used #%d is behind the highest ID in use #%d; "
+                "run check --fix to raise it" % (state.last_id, highest)
+            )
     for item in state.items:
         if item.item_id is None:
             warnings.append(
@@ -556,15 +615,6 @@ def require_root():
     return root
 
 
-def require_state(directory):
-    state_path = os.path.join(directory, STATE)
-    if not os.path.exists(state_path):
-        fail_cleanly("%s not found in this folder. Run statecat init first." % STATE)
-    archive_path = os.path.join(directory, ARCHIVE)
-    if not os.path.exists(archive_path):
-        fail_cleanly("%s not found in this folder. Run statecat init first." % ARCHIVE)
-
-
 def reject_newlines(text, label="item text"):
     """Reject \n / \r in item text before any snapshot or write."""
     if text is not None and ("\n" in text or "\r" in text):
@@ -655,6 +705,24 @@ def cmd_show(args):
     return 0
 
 
+def item_block_lines(state, item):
+    """Return the raw lines for an item plus its continuations."""
+    end = item.line_index + 1 + len(item.continuation_indices)
+    return [list(pair) for pair in state.lines[item.line_index:end]]
+
+
+def insert_block_before_heading(state, index, block_lines):
+    """Insert a whole item block, leaving a blank line before a heading."""
+    ending = state.dominant_ending()
+    for offset, pair in enumerate(block_lines):
+        state.lines.insert(index + offset, list(pair))
+    after = index + len(block_lines)
+    if after < len(state.lines) and state.lines[after][0].startswith("## "):
+        if state.lines[after - 1][0] != "":
+            state.lines.insert(after, ["", ending])
+    return index
+
+
 def insert_line_before_heading(state, index, line_content):
     """Insert a line at index, leaving a blank line before a heading.
 
@@ -711,23 +779,26 @@ def find_item_or_fail(state, item_id):
 
 
 def _move_impl(directory, state, archive, item, bucket):
-    """Move an item object already located in `state` to `bucket`."""
+    """Move an item object already located in `state` to `bucket`.
+
+    The item's indented continuations move with it, as one block.
+    """
     old_index = item.line_index
     ending = item.ending
+    block = item_block_lines(state, item)
     new_content = item.render()
     # Update the date on the move.
     new_item = Item(old_index, new_content, ending, bucket)
     new_item.item_date = today_str()
     new_item.starred = False
     rendered = new_item.render()
-    del state.lines[old_index]
+    block[0] = [rendered, block[0][1]]
+    del state.lines[old_index:old_index + len(block)]
     # Find the target bucket in the shortened file.
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    insert_line_before_heading(state, end, rendered)
-    # insert_line_before_heading used the dominant ending; preserve the
-    # moved item's own ending if it differed.
+    insert_block_before_heading(state, end, block)
     atomic_write(os.path.join(directory, STATE), state.lines)
 
 
@@ -784,10 +855,22 @@ def append_to_archive(archive, line_content, ending):
     """Append a line to the Archived section of the archive file."""
     start, end = archive.bucket_range("Archived")
     if start is None:
-        # Archive template uses "## Archived"; fall back to end of file.
-        archive.lines.append([line_content, ending])
-        return
+        fail_cleanly(
+            "archive file has no '## Archived' heading; "
+            "refusing to create a headerless archive entry"
+        )
     insert_line_before_heading(archive, end, line_content)
+
+
+def append_block_to_archive(archive, block_lines):
+    """Append a whole item block to the Archived section."""
+    start, end = archive.bucket_range("Archived")
+    if start is None:
+        fail_cleanly(
+            "archive file has no '## Archived' heading; "
+            "refusing to create a headerless archive entry"
+        )
+    insert_block_before_heading(archive, end, block_lines)
 
 
 def cmd_supersede(args):
@@ -815,12 +898,13 @@ def cmd_supersede(args):
     # Archive first, then STATE.md, each atomically.
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    append_to_archive(archive, old_content, old_ending or archive.dominant_ending())
+    block = item_block_lines(state, item)
+    append_block_to_archive(archive, block)
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
     state.set_last_id(new_id)
-    del state.lines[item.line_index]
+    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
     new_line = "- #%d [%s] %s" % (new_id, today_str(), new_text)
     insert_into_bucket(state, "Decided", new_line)
     atomic_write(os.path.join(directory, STATE), state.lines)
@@ -843,13 +927,12 @@ def cmd_archive(args):
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    old_content = item.content
-    old_ending = item.ending
-    append_to_archive(archive, old_content, old_ending or archive.dominant_ending())
+    block = item_block_lines(state, item)
+    append_block_to_archive(archive, block)
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     state, _archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    del state.lines[item.line_index]
+    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
     atomic_write(os.path.join(directory, STATE), state.lines)
     print("archived #%d" % item_id)
     return 0
@@ -887,10 +970,22 @@ def cmd_check(args):
             if changed:
                 state.lines[item.line_index][0] = item.render()
                 fixed.append(item.item_id)
-        if fixed:
+        # Raise a drifted counter to the highest ID actually in use.
+        highest = 0
+        for parsed in (state, archive):
+            for item_id in parsed.all_ids():
+                if item_id > highest:
+                    highest = item_id
+        counter_fixed = False
+        if state.last_id is not None and highest > state.last_id:
+            state.set_last_id(highest)
+            counter_fixed = True
+        if fixed or counter_fixed:
             atomic_write(os.path.join(directory, STATE), state.lines)
             for fixed_id in fixed:
                 print("fixed #%d" % fixed_id)
+            if counter_fixed:
+                print("fixed Last ID used to #%d" % highest)
         else:
             print("check: nothing to fix")
         return 0
