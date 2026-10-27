@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """StateCat v1: one living project state, readable by any agent in one read.
 
-Mascot: Tsuki, an all-black cat with glowing yellow eyes. Tsuki is the
-mascot and visual identity only. No feature is modelled on cat behaviour.
-
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
 in the project folder: STATE.md, STATE-ARCHIVE.md, and paired backups
 in .statecat/backups/.
 
 Normal output is banner-free and plain, one result per line, so agents
-can parse it. Tsuki appears only in --help and documentation.
+can parse it.
 
 State file format (human-readable, human-editable):
 
@@ -962,9 +959,7 @@ def build_parser():
         prog="statecat",
         description=(
             "StateCat v1: one living project state, readable by any agent "
-            "in one read. Mascot: Tsuki, an all-black cat with glowing "
-            "yellow eyes (mascot only; no feature is modelled on cat "
-            "behaviour). Local only, plain Markdown, no network calls."
+            "in one read. Local only, plain Markdown, no network calls."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)

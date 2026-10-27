@@ -4,10 +4,6 @@ StateCat keeps one living project state in one plain, local file, so a
 new agent session can start from what is already decided instead of
 reconstructing it from scattered notes and old chats.
 
-Mascot: Tsuki, an all-black cat with glowing yellow eyes. Tsuki is the
-mascot and visual identity only. No feature is modelled on cat
-behaviour.
-
 ## The pointer comes first
 
 A project using StateCat has this line in its agent instructions file
