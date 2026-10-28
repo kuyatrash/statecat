@@ -635,6 +635,16 @@ class StateCatTest(unittest.TestCase):
         self.assertNotIn("def require_state", cli_text)
         self.assertNotIn("require_state(", cli_text)
 
+    def test_github_polish_files_exist(self):
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "LICENSE")))
+        self.assertIn("MIT License", read_text(os.path.join(ROOT, "LICENSE")))
+        readme = read_text(os.path.join(ROOT, "README.md"))
+        self.assertIn("Try it in 2 minutes", readme)
+        self.assertNotIn("logo.svg", readme)
+        self.assertIn("demo/DEMO.md", readme)
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "demo", "DEMO.md")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "demo", "run-demo.sh")))
+
     def test_windows_py_note_and_gitignore(self):
         readme = read_text(os.path.join(ROOT, "README.md"))
         skill = read_text(os.path.join(ROOT, "SKILL.md"))

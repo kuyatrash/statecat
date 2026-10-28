@@ -1,15 +1,68 @@
-# StateCat v1 — user guide
+# StateCat — one living project state, readable by any agent in one read
 
-StateCat keeps one living project state in one plain, local file,
-so a new agent session can start from what is already decided
-instead of reconstructing it from scattered notes and old chats.
+Agents lose context. Sessions get compacted, memory notes drift,
+and the next session wastes its first hour reconstructing what was
+already decided, re-asking settled questions, and re-proposing
+parked work.
 
-Normal CLI output is banner-free so agents can parse it.
+StateCat fixes that with one plain, local file. A new agent reads
+`STATE.md` first and instantly knows: what is decided, what is
+open, what is waiting on the human, what is waiting on others,
+and what is parked and must not be nagged about.
 
-StateCat is local only. It makes no network calls, has no account,
-no cloud, no sync, and no installer. It is one Python script
-(`statecat.py`, Python 3.8+, no installed packages) plus two
-Markdown files in your project folder.
+Local only. No network calls, no account, no cloud, no sync, no
+installer. One Python script (`statecat.py`, Python 3.8+, no
+installed packages) plus two Markdown files in your project
+folder. Normal CLI output is banner-free so agents can parse it.
+MIT licensed, see [LICENSE](LICENSE).
+
+## Try it in 2 minutes
+
+```sh
+# Get the single script (or clone this repo and copy statecat.py)
+curl -O https://raw.githubusercontent.com/kuyatrash/statecat/main/statecat.py
+
+# In your project folder:
+python3 statecat.py init "My Project"
+python3 statecat.py add Decided "Use local Markdown state files" --because "plain text survives every tool"
+python3 statecat.py add Open "Ship the first release"
+python3 statecat.py show
+```
+
+Then add this line to your project's agent instructions file
+(for example `AGENTS.md`, see `AGENTS-pointer.md`):
+
+```text
+Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
+```
+
+That pointer, not the skill, is the real read-first mechanism.
+
+## Before and after
+
+Without StateCat, a fresh session asks: "What did we decide about
+hosting? Is the pricing work still open? Should I bring up the
+mobile app again?"
+
+With StateCat, the same session reads once and knows:
+
+```text
+## Decided
+- #1 [2026-10-26] Use local Markdown state files, because plain text survives every tool
+
+## Open
+- #2 [2026-10-26] Ship the first release
+
+## Waiting on human
+- #3 [2026-10-26] Pick a launch date
+
+## Parked
+- #4 [2026-10-26] Mobile app, do not raise without owner approval
+```
+
+No settled question re-asked, no parked item proposed. See
+[demo/DEMO.md](demo/DEMO.md) for a full worked session, and
+`example/` for a complete state file.
 
 ## Starting a new project
 
