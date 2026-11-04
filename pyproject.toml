@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statecat"
+version = "1.1.0"
+description = "One living project state, readable by any agent in one read."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "kuyatrash"}]
+
+[project.scripts]
+statecat = "statecat:main"
+
+[tool.setuptools]
+py-modules = ["statecat"]
