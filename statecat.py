@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1: one living project state, readable by any agent in one read.
+"""StateCat v1.1: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -68,12 +68,17 @@ Rules implemented here (StateCat scope, revision 5):
 """
 
 import argparse
+import difflib
+import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 from datetime import date
+
+VERSION = "1.1.0"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -105,6 +110,17 @@ SIZE_LINE_LIMIT = 150
 SIZE_BYTE_LIMIT = 10 * 1024
 STALE_DAYS = 14
 BACKUPS_KEPT = 20
+
+# One writer at a time, enforced with a lock directory. The lock is an
+# atomic mkdir under .statecat/, so it works on Unix and Windows alike
+# (no fcntl). A lock older than LOCK_STALE_SECONDS is treated as left
+# behind by a crashed process and broken. Timeouts are overridable
+# with STATECAT_LOCK_TIMEOUT / STATECAT_LOCK_STALE (seconds), mainly
+# so tests can use short waits.
+LOCK_DIRNAME = "lock"
+LOCK_TIMEOUT_SECONDS = 10.0
+LOCK_STALE_SECONDS = 60.0
+LOCK_POLL_SECONDS = 0.05
 
 
 def today_str():
@@ -152,7 +168,7 @@ class Item:
         if not body.startswith("- "):
             return
         rest = body[2:]
-        m = re.match(r"#(\d+) \[(\d{4}-\d{2}-\d{2})(\*)?\] (.*)$", rest)
+        m = re.match(r"#(\d+) \[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
         if m:
             self.item_id = int(m.group(1))
             self.item_date = m.group(2)
@@ -164,7 +180,7 @@ class Item:
             self.item_id = int(m.group(1))
             self.text = m.group(2)
             return
-        m = re.match(r"\[(\d{4}-\d{2}-\d{2})(\*)?\] (.*)$", rest)
+        m = re.match(r"\[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
         if m:
             self.item_date = m.group(1)
             self.starred = bool(m.group(2))
@@ -285,8 +301,7 @@ class StateFile:
             for item in self.items:
                 if item.line_index >= insert_at:
                     item.line_index += 1
-            if self.last_id_index is not None and self.last_id_index >= insert_at:
-                self.last_id_index += 1
+            self.last_id_index = insert_at
         self.last_id = value
 
     def dominant_ending(self):
@@ -391,8 +406,22 @@ def structural_problems(state, archive):
     return problems
 
 
+def item_age_days(item, today=None):
+    """Days since an item's date, or None when its age is unknown
+    (no date, starred date, or unparseable date)."""
+    if item.item_date is None or item.starred:
+        return None
+    try:
+        year, month, day = (int(part) for part in item.item_date.split("-"))
+        item_date = date(year, month, day)
+    except ValueError:
+        return None
+    return ((today or date.today()) - item_date).days
+
+
 def warnings_for(state, archive, directory=None):
     """Return a list of warning strings (never blocking)."""
+    config = load_config(directory) if directory else dict(DEFAULT_CONFIG)
     warnings = []
     if state.last_id is None:
         warnings.append("warning: Last ID used line is missing in %s" % STATE)
@@ -424,35 +453,48 @@ def warnings_for(state, archive, directory=None):
                 "whose age is unknown, not fresh"
                 % (item.item_id, STATE, item.item_date)
             )
+    for item in archive.items:
+        if item.item_id is None:
+            warnings.append(
+                "warning: line %d in %s has no ID"
+                % (item.line_index + 1, ARCHIVE)
+            )
+        if item.item_date is None:
+            warnings.append(
+                "warning: line %d in %s has no date"
+                % (item.line_index + 1, ARCHIVE)
+            )
     # Size budget.
     try:
         size = os.path.getsize(os.path.join(directory or os.getcwd(), STATE))
     except OSError:
         size = 0
     line_count = len(state.lines)
-    if line_count > SIZE_LINE_LIMIT or size > SIZE_BYTE_LIMIT:
+    if line_count > config["size_lines"] or size > config["size_bytes"]:
         warnings.append(
             "warning: %s is over the size budget (%d lines, %d bytes; "
             "budget %d lines / %d bytes)"
-            % (STATE, line_count, size, SIZE_LINE_LIMIT, SIZE_BYTE_LIMIT)
+            % (STATE, line_count, size, config["size_lines"], config["size_bytes"])
         )
-    # Stale Waiting on human items: unstarred dates older than 14 days.
+    # Stale waiting items: unstarred dates older than the configured days.
     today = date.today()
     for item in state.items:
-        if item.bucket != "Waiting on human":
+        if item.bucket not in ("Waiting on human", "Waiting on others"):
             continue
-        if item.item_date is None or item.starred:
+        age = item_age_days(item, today)
+        if age is None or age <= config["stale_days"]:
             continue
-        try:
-            year, month, day = (int(part) for part in item.item_date.split("-"))
-            item_date = date(year, month, day)
-        except ValueError:
-            continue
-        if (today - item_date).days > STALE_DAYS:
+        if item.bucket == "Waiting on human":
             warnings.append(
                 "stale: #%d in Waiting on human is %d days old "
                 "(owner only, not a prompt to chase)"
-                % (item.item_id, (today - item_date).days)
+                % (item.item_id, age)
+            )
+        else:
+            warnings.append(
+                "stale: #%d in Waiting on others is %d days old "
+                "(not a prompt to chase)"
+                % (item.item_id, age)
             )
     return warnings
 
@@ -499,6 +541,151 @@ def backup_root(directory):
     return os.path.join(directory, BACKUP_ROOT)
 
 
+class project_lock:
+    """Cross-platform write lock for one project, via atomic mkdir.
+
+    Use as a context manager around a whole read-modify-write command:
+    the lock is held from before the first read until after the last
+    write, so two writers can no longer both read the same Last ID
+    used, assign the same next ID, and silently lose one item.
+    Read-only commands do not take the lock.
+    """
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.lock_path = os.path.join(directory, ".statecat", LOCK_DIRNAME)
+        self.acquired = False
+
+    def _lock_age(self):
+        try:
+            return time.time() - os.path.getmtime(self.lock_path)
+        except OSError:
+            return 0.0
+
+    def __enter__(self):
+        # Timeout and staleness: STATECAT_LOCK_TIMEOUT / STATECAT_LOCK_STALE
+        # (for tests) override .statecat/config, which overrides defaults.
+        config = load_config(self.directory)
+        try:
+            timeout = float(os.environ.get("STATECAT_LOCK_TIMEOUT", config["lock_timeout"]))
+        except ValueError:
+            timeout = config["lock_timeout"]
+        try:
+            stale = float(os.environ.get("STATECAT_LOCK_STALE", config["lock_stale"]))
+        except ValueError:
+            stale = config["lock_stale"]
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                os.mkdir(self.lock_path)
+            except FileExistsError:
+                if self._lock_age() > stale:
+                    shutil.rmtree(self.lock_path, ignore_errors=True)
+                    continue
+                if time.monotonic() >= deadline:
+                    sys.stderr.write(
+                        "error: another statecat process is writing in this project; "
+                        "the lock is held. Try again in a moment.\n"
+                    )
+                    sys.stderr.write("No files were changed.\n")
+                    sys.exit(1)
+                time.sleep(LOCK_POLL_SECONDS)
+                continue
+            except FileNotFoundError:
+                os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+                continue
+            break
+        try:
+            with open(os.path.join(self.lock_path, "owner"), "w", encoding="utf-8") as handle:
+                handle.write("pid=%d time=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
+        except OSError:
+            pass
+        self.acquired = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.acquired:
+            shutil.rmtree(self.lock_path, ignore_errors=True)
+            self.acquired = False
+        return False
+
+
+CONFIG_FILENAME = "config"
+CONFIG_KEYS = {
+    "stale_days": int,
+    "size_lines": int,
+    "size_bytes": int,
+    "backups_kept": int,
+    "lock_timeout": float,
+    "lock_stale": float,
+}
+DEFAULT_CONFIG = {
+    "stale_days": STALE_DAYS,
+    "size_lines": SIZE_LINE_LIMIT,
+    "size_bytes": SIZE_BYTE_LIMIT,
+    "backups_kept": BACKUPS_KEPT,
+    "lock_timeout": LOCK_TIMEOUT_SECONDS,
+    "lock_stale": LOCK_STALE_SECONDS,
+}
+
+
+def config_path(directory):
+    return os.path.join(directory, ".statecat", CONFIG_FILENAME)
+
+
+def load_config(directory):
+    """Effective config: defaults, overlaid with .statecat/config (JSON).
+
+    Unknown keys are ignored; values that do not coerce to the right
+    type fall back to their default. A missing or broken file means
+    plain defaults."""
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(config_path(directory), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return config
+    if not isinstance(raw, dict):
+        return config
+    for key, caster in CONFIG_KEYS.items():
+        if key in raw:
+            try:
+                config[key] = caster(raw[key])
+            except (TypeError, ValueError):
+                continue
+    return config
+
+
+def save_config(directory, config):
+    os.makedirs(os.path.dirname(config_path(directory)), exist_ok=True)
+    atomic_write(config_path(directory), [[json.dumps(config, indent=2), "\n"]])
+
+
+def cmd_config(args):
+    directory = require_root()
+    if getattr(args, "action", None) == "set":
+        key = args.key
+        if key not in CONFIG_KEYS:
+            sys.stderr.write(
+                "error: unknown config key %r; known keys: %s\n"
+                % (key, ", ".join(sorted(CONFIG_KEYS)))
+            )
+            return 1
+        try:
+            value = CONFIG_KEYS[key](args.value)
+        except (TypeError, ValueError):
+            sys.stderr.write("error: %r is not a valid value for %s\n" % (args.value, key))
+            return 1
+        config = load_config(directory)
+        config[key] = value
+        save_config(directory, config)
+        print("set %s = %s" % (key, value))
+        return 0
+    print(json.dumps(load_config(directory), indent=2))
+    return 0
+
+
 def list_snapshots(directory):
     """Return [(name, kind, path)] sorted oldest first.
 
@@ -521,20 +708,22 @@ def list_snapshots(directory):
 
 
 def prune_snapshots(directory):
-    """Keep at most 20 snapshots in total, counting safety snapshots.
+    """Keep at most the configured number of snapshots in total,
+    counting safety snapshots.
 
     The most recent pre-write snapshot is never pruned, so the
     restore default always remains available.
     """
+    keep = load_config(directory)["backups_kept"]
     root = backup_root(directory)
     if not os.path.isdir(root):
         return
     snapshots = list_snapshots(directory)
-    if len(snapshots) <= BACKUPS_KEPT:
+    if len(snapshots) <= keep:
         return
     pre_write = [item for item in snapshots if item[1] == "pre-write"]
     latest_pre = pre_write[-1] if pre_write else None
-    excess = len(snapshots) - BACKUPS_KEPT
+    excess = len(snapshots) - keep
     deleted = 0
     by_time = sorted(snapshots, key=lambda item: os.path.getmtime(item[2]))
     for name, kind, path in by_time:
@@ -661,6 +850,78 @@ def lines_from_contents(contents, ending="\n"):
     return [[content, ending] for content in contents]
 
 
+POINTER_LINE = (
+    "Read STATE.md first, then run python3 statecat.py check, "
+    "before asking about or working on this project."
+)
+POINTER_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def install_pointer(directory, create=True):
+    """Append the read-first pointer line to the project's agent
+    instructions file (AGENTS.md, else CLAUDE.md), creating AGENTS.md
+    when neither exists and create is true. Returns a short message
+    describing what happened, or None when nothing was done."""
+    target = None
+    for name in POINTER_FILES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            target = path
+            break
+    if target is None:
+        if not create:
+            return None
+        target = os.path.join(directory, "AGENTS.md")
+        try:
+            with open(target, "w", encoding="utf-8", newline="") as handle:
+                handle.write("# Project instructions\n\n%s\n" % POINTER_LINE)
+        except OSError as exc:
+            sys.stderr.write("warning: could not create %s: %s\n" % (target, exc))
+            return None
+        return "created AGENTS.md with pointer"
+    try:
+        with open(target, "r", encoding="utf-8", newline="") as handle:
+            content = handle.read()
+    except OSError as exc:
+        sys.stderr.write("warning: could not read %s: %s\n" % (target, exc))
+        return None
+    if POINTER_LINE in content:
+        return "pointer already in %s" % os.path.basename(target)
+    try:
+        with open(target, "a", encoding="utf-8", newline="") as handle:
+            if content and not content.endswith("\n"):
+                handle.write("\n")
+            handle.write("%s\n" % POINTER_LINE)
+    except OSError as exc:
+        sys.stderr.write("warning: could not update %s: %s\n" % (target, exc))
+        return None
+    return "added pointer to %s" % os.path.basename(target)
+
+
+def ensure_gitignore(directory):
+    """Make sure .statecat/ is gitignored, so paired backups are never
+    committed. Creates .gitignore when there is none. Returns a short
+    message, or None when nothing was done."""
+    path = os.path.join(directory, ".gitignore")
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", newline="") as handle:
+                content = handle.read()
+            if any(line.strip() in (".statecat/", ".statecat") for line in content.splitlines()):
+                return ".statecat/ already in .gitignore"
+            with open(path, "a", encoding="utf-8", newline="") as handle:
+                if content and not content.endswith("\n"):
+                    handle.write("\n")
+                handle.write(".statecat/\n")
+            return "added .statecat/ to .gitignore"
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(".statecat/\n")
+        return "created .gitignore with .statecat/"
+    except OSError as exc:
+        sys.stderr.write("warning: could not update .gitignore: %s\n" % exc)
+        return None
+
+
 def cmd_init(args):
     directory = os.getcwd()
     parent_root = find_project_root(os.path.dirname(os.path.abspath(directory)))
@@ -682,12 +943,65 @@ def cmd_init(args):
     atomic_write(archive_path, lines_from_contents(template_archive(project)))
     print("created %s" % STATE)
     print("created %s" % ARCHIVE)
+    if not getattr(args, "no_pointer", False):
+        message = install_pointer(directory)
+        if message:
+            print(message)
+    if not getattr(args, "no_gitignore", False):
+        message = ensure_gitignore(directory)
+        if message:
+            print(message)
     return 0
+
+
+def cmd_pointer(args):
+    if getattr(args, "install", False):
+        message = install_pointer(os.getcwd())
+        if message:
+            print(message)
+        return 0
+    print(POINTER_LINE)
+    return 0
+
+
+def project_name(state):
+    """Project name from the '# Project: X' header line, or None."""
+    for content, _ending in state.lines:
+        if content.startswith("# Project:"):
+            return content.split(":", 1)[1].strip() or None
+    return None
+
+
+def item_to_dict(item):
+    return {
+        "id": item.item_id,
+        "date": item.item_date,
+        "starred": item.starred,
+        "text": item.text,
+    }
 
 
 def cmd_show(args):
     directory = require_root()
     state, _archive = read_state_and_archive(directory)
+    if getattr(args, "json", False):
+        buckets = [args.bucket] if args.bucket else list(BUCKETS)
+        if args.bucket:
+            bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
+            if bucket is None:
+                sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
+                return 1
+            buckets = [bucket]
+        data = {
+            "project": project_name(state),
+            "last_id": state.last_id,
+            "buckets": {
+                bucket: [item_to_dict(item) for item in state.items if item.bucket == bucket]
+                for bucket in buckets
+            },
+        }
+        print(json.dumps(data, indent=2))
+        return 0
     if args.bucket:
         bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
         if bucket is None:
@@ -702,6 +1016,61 @@ def cmd_show(args):
     else:
         for content, ending in state.lines:
             sys.stdout.write(content + ending)
+    return 0
+
+
+def cmd_status(args):
+    directory = require_root()
+    state, archive = read_state_and_archive(directory)
+    problems = structural_problems(state, archive)
+    warnings = warnings_for(state, archive, directory)
+    stale = [warning for warning in warnings if warning.startswith("stale:")]
+    counts = {bucket: 0 for bucket in BUCKETS}
+    for item in state.items:
+        if item.bucket in counts:
+            counts[item.bucket] += 1
+    print("StateCat status: %s" % (project_name(state) or "Unnamed project"))
+    print(", ".join("%s: %d" % (bucket, counts[bucket]) for bucket in BUCKETS))
+    print("Archived: %d" % len(archive.items))
+    if stale:
+        print("Stale waiting items: %d" % len(stale))
+    print("Last ID used: #%s" % (state.last_id if state.last_id is not None else "?"))
+    try:
+        size = os.path.getsize(os.path.join(directory, STATE))
+    except OSError:
+        size = 0
+    print("%s: %d lines, %d bytes" % (STATE, len(state.lines), size))
+    if problems:
+        print("check: %d structural problem(s)" % len(problems))
+        return 1
+    if warnings:
+        print("check: %d warning(s)" % len(warnings))
+    else:
+        print("check: clean")
+    return 0
+
+
+def cmd_search(args):
+    directory = require_root()
+    state, archive = read_state_and_archive(directory)
+    needle = args.text.lower()
+    found = []
+    for item in state.items:
+        if needle in item.text.lower():
+            found.append((item.bucket, item))
+    if getattr(args, "archive", False):
+        for item in archive.items:
+            if needle in item.text.lower():
+                found.append(("Archived", item))
+    if not found:
+        print("no matches for %r" % args.text)
+        return 1
+    for bucket, item in found:
+        item_id = "#%d" % item.item_id if item.item_id is not None else "#?"
+        item_date = item.item_date or "no date"
+        if item.starred:
+            item_date += "*"
+        print("- %s [%s] (%s) %s" % (item_id, item_date, bucket, item.text))
     return 0
 
 
@@ -912,6 +1281,57 @@ def cmd_supersede(args):
     return 0
 
 
+def compact_candidates(state, days):
+    """Decided items older than `days`, and how many Decided items
+    were skipped because their age is unknown (no date, starred
+    date, or unparseable date). Only Decided items are ever compacted:
+    Open and waiting items are still live."""
+    today = date.today()
+    candidates = []
+    skipped = 0
+    for item in state.items:
+        if item.bucket != "Decided":
+            continue
+        age = item_age_days(item, today)
+        if age is None:
+            skipped += 1
+        elif age > days:
+            candidates.append(item)
+    return candidates, skipped
+
+
+def cmd_compact(args):
+    directory = require_root()
+    state, archive = read_state_and_archive(directory)
+    problems = structural_problems(state, archive)
+    if problems:
+        sys.stderr.write("error: structural problems must be fixed before compact can run.\n")
+        return 1
+    candidates, skipped = compact_candidates(state, args.older_than)
+    if not candidates:
+        print("nothing to compact")
+        if skipped:
+            print("skipped %d Decided item(s) with unknown age" % skipped)
+        return 0
+    if args.dry_run:
+        for item in candidates:
+            print("would archive #%d %s" % (item.item_id, item.text))
+        return 0
+    take_snapshot(directory, "pre-write")
+    state, archive = read_state_and_archive(directory)
+    candidates, _skipped = compact_candidates(state, args.older_than)
+    # Delete in reverse line order so earlier indices stay valid.
+    for item in sorted(candidates, key=lambda candidate: candidate.line_index, reverse=True):
+        block = item_block_lines(state, item)
+        append_block_to_archive(archive, block)
+        del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
+    atomic_write(os.path.join(directory, STATE), state.lines)
+    for item in sorted(candidates, key=lambda candidate: candidate.item_id):
+        print("archived #%d" % item.item_id)
+    return 0
+
+
 def cmd_archive(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
@@ -999,6 +1419,20 @@ def cmd_check(args):
     return 0
 
 
+def find_snapshot(snapshots, name):
+    """Find one snapshot by exact name or unique prefix.
+
+    Returns (name, kind, path), or None when there is no match.
+    Raises ValueError on an ambiguous prefix."""
+    match = None
+    for candidate in snapshots:
+        if candidate[0] == name or candidate[0].startswith(name):
+            if match is not None:
+                raise ValueError("ambiguous snapshot %r" % name)
+            match = candidate
+    return match
+
+
 def cmd_restore(args):
     directory = find_restore_root()
     if directory is None:
@@ -1019,13 +1453,11 @@ def cmd_restore(args):
             print("%s %s" % (name, kind))
         return 0
     if args.snapshot:
-        match = None
-        for name, kind, path in snapshots:
-            if name == args.snapshot or name.startswith(args.snapshot):
-                if match is not None:
-                    sys.stderr.write("error: ambiguous snapshot %r\n" % args.snapshot)
-                    return 1
-                match = (name, kind, path)
+        try:
+            match = find_snapshot(snapshots, args.snapshot)
+        except ValueError as exc:
+            sys.stderr.write("error: %s\n" % exc)
+            return 1
         if match is None:
             sys.stderr.write("error: no snapshot %r\n" % args.snapshot)
             return 1
@@ -1046,6 +1478,57 @@ def cmd_restore(args):
                 data = handle.read()
             atomic_write_bytes(target, data)
     print("restored %s" % target_name)
+    # Verify what was restored: a snapshot can itself carry structural
+    # problems, and installing it silently would trade one broken
+    # state for another.
+    state, archive = read_state_and_archive(directory)
+    problems = structural_problems(state, archive)
+    if problems:
+        print("warning: restored files have structural problems:")
+        for problem in problems:
+            print("problem: %s" % problem)
+    return 0
+
+
+def cmd_diff(args):
+    directory = require_root()
+    snapshots = list_snapshots(directory)
+    if args.snapshot:
+        try:
+            match = find_snapshot(snapshots, args.snapshot)
+        except ValueError as exc:
+            sys.stderr.write("error: %s\n" % exc)
+            return 1
+        if match is None:
+            sys.stderr.write("error: no snapshot %r\n" % args.snapshot)
+            return 1
+        target_name, _kind, target_path = match
+    else:
+        pre_write = [item for item in snapshots if item[1] == "pre-write"]
+        if not pre_write:
+            sys.stderr.write("error: no pre-write snapshot to diff against\n")
+            return 1
+        target_name, _kind, target_path = pre_write[-1]
+    state, archive = read_state_and_archive(directory)
+    changed = False
+    for filename, current in ((STATE, state.lines), (ARCHIVE, archive.lines)):
+        snapshot_file = os.path.join(target_path, filename)
+        if not os.path.exists(snapshot_file):
+            continue
+        with open(snapshot_file, "r", encoding="utf-8", newline="") as handle:
+            old = handle.readlines()
+        new = [content + ending for content, ending in current]
+        diff = list(difflib.unified_diff(
+            old, new,
+            fromfile="%s/%s" % (target_name, filename),
+            tofile=filename,
+        ))
+        if diff:
+            changed = True
+            for line in diff:
+                sys.stdout.write(line if line.endswith("\n") else line + "\n")
+    if not changed:
+        print("no differences")
     return 0
 
 
@@ -1053,19 +1536,35 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1: one living project state, readable by any agent "
+            "StateCat v1.1: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )
+    parser.add_argument("--version", action="version", version="statecat " + VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="Create STATE.md, STATE-ARCHIVE.md, and .statecat/backups/")
     p.add_argument("project", nargs="?", help="Project name for the About header")
+    p.add_argument("--no-pointer", action="store_true", help="Do not install the read-first pointer line")
+    p.add_argument("--no-gitignore", action="store_true", help="Do not add .statecat/ to .gitignore")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("pointer", help="Print the read-first pointer line, or install it with --install")
+    p.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
+    p.set_defaults(func=cmd_pointer)
 
     p = sub.add_parser("show", help="Print the full state, or one bucket")
     p.add_argument("bucket", nargs="?", help="Bucket name, e.g. Open")
+    p.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of Markdown")
     p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("status", help="Print a compact summary: counts, stale items, size, check result")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("search", help="Search item text (case-insensitive substring)")
+    p.add_argument("text", help="Text to find")
+    p.add_argument("--archive", action="store_true", help="Also search STATE-ARCHIVE.md")
+    p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("add", help="Add a dated line to a bucket")
     p.add_argument("bucket", help="Bucket name")
@@ -1096,6 +1595,17 @@ def build_parser():
     p.add_argument("--owner-approved", action="store_true", help="Required for a parked item")
     p.set_defaults(func=cmd_archive)
 
+    p = sub.add_parser("compact", help="Archive Decided items older than N days")
+    p.add_argument("--older-than", type=int, default=90, metavar="DAYS", help="Archive Decided items older than this (default 90)")
+    p.add_argument("--dry-run", action="store_true", help="List what would be archived, without writing")
+    p.set_defaults(func=cmd_compact)
+
+    p = sub.add_parser("config", help="Show the effective .statecat/config, or set one key")
+    p.add_argument("action", nargs="?", choices=["set"], help="Use 'set' to change one key")
+    p.add_argument("key", nargs="?", help="Config key, e.g. stale_days")
+    p.add_argument("value", nargs="?", help="New value for the key")
+    p.set_defaults(func=cmd_config)
+
     p = sub.add_parser("check", help="Report structural problems and warnings")
     p.add_argument("--fix", action="store_true", help="Assign missing IDs and starred dates (Parked-guard exempt)")
     p.add_argument("--fix-ids", dest="fix_ids", action="store_true", help="Alias for --fix")
@@ -1106,12 +1616,32 @@ def build_parser():
     p.add_argument("--list", action="store_true", help="List snapshots")
     p.set_defaults(func=cmd_restore)
 
+    p = sub.add_parser("diff", help="Show the unified diff between a snapshot and the current files")
+    p.add_argument("snapshot", nargs="?", help="Snapshot name, or omit for the most recent pre-write snapshot")
+    p.set_defaults(func=cmd_diff)
+
     return parser
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Write commands run whole read-modify-write cycles under the
+    # project lock, so two writers cannot silently lose an item.
+    # Read-only commands do not take the lock.
+    if args.command in ("add", "move", "update", "supersede", "archive", "compact"):
+        directory = require_root()
+        with project_lock(directory):
+            return args.func(args)
+    if args.command == "check" and (getattr(args, "fix", False) or getattr(args, "fix_ids", False)):
+        directory = require_root()
+        with project_lock(directory):
+            return args.func(args)
+    if args.command == "restore" and not args.list:
+        directory = find_restore_root()
+        if directory is not None:
+            with project_lock(directory):
+                return args.func(args)
     return args.func(args)
 
 

@@ -22,6 +22,10 @@ MIT licensed, see [LICENSE](LICENSE).
 # Get the single script (or clone this repo and copy statecat.py)
 curl -O https://raw.githubusercontent.com/kuyatrash/statecat/main/statecat.py
 
+# Or install it with pip (Python 3.8+)
+pip install .
+# then just run: statecat init "My Project"
+
 # In your project folder:
 python3 statecat.py init "My Project"
 python3 statecat.py add Decided "Use local Markdown state files" --because "plain text survives every tool"
@@ -29,8 +33,13 @@ python3 statecat.py add Open "Ship the first release"
 python3 statecat.py show
 ```
 
-Then add this line to your project's agent instructions file
-(for example `AGENTS.md`, see `AGENTS-pointer.md`):
+`init` adds the pointer line below to your project's agent
+instructions file (`AGENTS.md`, or `CLAUDE.md` when that is the
+file you already have), and adds `.statecat/` to `.gitignore`, so
+paired backups are never committed. Use `--no-pointer` or
+`--no-gitignore` to skip either step. For a project that already
+has a state file, `python3 statecat.py pointer --install` adds the
+line, and `python3 statecat.py pointer` just prints it.
 
 ```text
 Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
@@ -73,7 +82,9 @@ python3 statecat.py init "My Project"
 ```
 
 This creates `STATE.md`, `STATE-ARCHIVE.md`, and
-`.statecat/backups/`. It refuses to overwrite existing files.
+`.statecat/backups/`, installs the read-first pointer line into
+`AGENTS.md` (or `CLAUDE.md`), and adds `.statecat/` to
+`.gitignore`. It refuses to overwrite existing files.
 
 On Windows, `python3` often is not on PATH; use `py` or `python`
 instead, for example `py statecat.py check`. On Unix, if
@@ -86,31 +97,36 @@ buckets: Decided, Open, Waiting on human, Waiting on others, and
 Parked. `STATE-ARCHIVE.md` holds completed and superseded items
 and is not part of the one-read load.
 
-Add the pointer line to your project's agent instructions file
-(see `AGENTS-pointer.md`). If `statecat.py` lives somewhere other
-than your project root, use that path instead, for example
-`python3 ~/workspace/statecat/statecat.py check`. If you copied
-`statecat.py` and the optional `statecat` launcher into your
-project root, `./statecat check` also works on Unix:
-
-```text
-Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
-```
-
 ## Everyday commands
 
 ```sh
 python3 statecat.py show
 python3 statecat.py show Open
+python3 statecat.py show --json
+python3 statecat.py status
+python3 statecat.py search "launch date"
 python3 statecat.py add Open "Bake the test batch"
 python3 statecat.py add Decided "Sell at the Saturday market" --because "foot traffic is highest there"
 python3 statecat.py move 2 "Waiting on human"
 python3 statecat.py update 2 "Bake the test batch on Friday"
 python3 statecat.py archive 2
+python3 statecat.py compact --older-than 90
 python3 statecat.py check
 python3 statecat.py restore --list
 python3 statecat.py restore
+python3 statecat.py diff
 ```
+
+`show --json` prints the same state as machine-readable JSON
+(project, last ID, and one item list per bucket) for agents that
+would rather parse JSON than Markdown. `status` prints a compact
+summary: bucket counts, stale waiting items, Last ID used, file
+size, and the check result. `search` finds items by
+case-insensitive text, with `--archive` to include archived items.
+`compact` archives Decided items older than N days (default 90),
+with `--dry-run` to preview; it never touches live buckets.
+`diff` shows the unified diff between a snapshot and the current
+files, so you can see what changed before restoring.
 
 Every item gets a plain-number ID, for example #12, from one
 global counter stored in the "Last ID used" line. An ID never
@@ -242,6 +258,11 @@ flip back. You can still restore a safety snapshot by naming it
 explicitly. There is no single-file restore: restoring only
 `STATE.md` after a supersede would recreate a duplicate ID.
 
+After a restore, the CLI verifies the restored files and warns
+when they have structural problems, instead of silently installing
+a broken snapshot. Use `diff` first to see what a restore would
+change:
+
 If a two-file write was interrupted, `check` reports the
 duplicate ID and names the `STATE-ARCHIVE.md` copy as the stray
 and the `STATE.md` copy as live. The defined recovery is paired
@@ -258,15 +279,50 @@ recovery.
 counts as the one allowed mention of a stale Waiting on human
 item for the session. An agent may mention such an item at most
 once per session, and never again once you have acknowledged it.
-`check` flags Waiting on human items with a real (unstarred) date
-older than 14 days for the owner only; it does not chase them.
-It also warns when `STATE.md` grows past 150 lines or 10 KB,
-because the archive must not creep back into the main file.
+`check` flags Waiting on human and Waiting on others items with a
+real (unstarred) date older than 14 days for the owner only; it
+does not chase them. It also warns when `STATE.md` grows past 150
+lines or 10 KB, because the archive must not creep back into the
+main file. The 14-day threshold and the size budget are tunable
+in `.statecat/config` (see Configuration).
+
+## Configuration
+
+`.statecat/config` is a JSON file that tunes the defaults:
+
+```json
+{
+  "stale_days": 14,
+  "size_lines": 150,
+  "size_bytes": 10240,
+  "backups_kept": 20,
+  "lock_timeout": 10.0,
+  "lock_stale": 60.0
+}
+```
+
+`statecat.py config` prints the effective settings;
+`statecat.py config set stale_days 30` changes one key. Unknown
+keys are ignored and bad values fall back to their defaults, so a
+hand-edited config can never break the CLI. The config file is
+local only: it lives under `.statecat/`, which `init` gitignores.
+
+## One writer at a time, enforced
+
+Two writers at once used to silently lose an item: both read the
+same Last ID used, assigned the same next ID, and the last write
+won. Writes now run under a cross-platform lock directory
+(`.statecat/lock`), held from before the first read until after
+the last write. A second writer waits up to 10 seconds, then
+fails cleanly with "the lock is held" and changes nothing. A lock
+left behind by a crashed process is broken after 60 seconds.
+Read-only commands (`show`, `check` without `--fix`, `search`,
+`status`, `diff`) do not take the lock.
 
 ## What StateCat is not
 
 StateCat v1 is not a task manager, a chat product, a notes app,
 or a memory database. It has no due dates, reminders, priorities,
-calendars, cloud sync, or graphical interface. One writer at a
-time. If you need those, they are out of scope for v1 and need a
-separate, explicit approval.
+calendars, cloud sync, or graphical interface. If you need those,
+they are out of scope for v1 and need a separate, explicit
+approval.

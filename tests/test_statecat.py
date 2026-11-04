@@ -8,12 +8,14 @@ fixture. Exit code 0 means every test passed; the final line
 reports the pass/fail count honestly.
 """
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date
 
@@ -29,6 +31,18 @@ def run_cli(cwd, *args):
         cwd=cwd,
         capture_output=True,
         text=True,
+    )
+
+
+def run_cli_env(cwd, env, *args):
+    merged = dict(os.environ)
+    merged.update(env)
+    return subprocess.run(
+        [sys.executable, CLI, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=merged,
     )
 
 
@@ -652,6 +666,302 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("py", skill)
         gitignore = read_text(os.path.join(ROOT, ".gitignore"))
         self.assertIn("__pycache__/", gitignore)
+
+    # v1.1: one writer at a time, enforced with a lock directory.
+    def test_concurrent_adds_keep_both_items(self):
+        self.init_project()
+        env = dict(os.environ, STATECAT_LOCK_TIMEOUT="10")
+        first = subprocess.Popen(
+            [sys.executable, CLI, "add", "Open", "first writer"],
+            cwd=self.dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+        second = subprocess.Popen(
+            [sys.executable, CLI, "add", "Open", "second writer"],
+            cwd=self.dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+        _out1, err1 = first.communicate()
+        _out2, err2 = second.communicate()
+        self.assertEqual(first.returncode, 0, err1)
+        self.assertEqual(second.returncode, 0, err2)
+        lines = item_lines(read_text(state_path(self.dir)))
+        self.assertEqual(sorted(lines), [1, 2])
+        texts = list(lines.values())
+        self.assertTrue(any("first writer" in line for line in texts))
+        self.assertTrue(any("second writer" in line for line in texts))
+
+    def test_held_lock_fails_cleanly_without_write(self):
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5"},
+            "add", "Open", "blocked writer",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lock is held", result.stderr)
+        self.assertNotIn("blocked writer", read_text(state_path(self.dir)))
+        self.assertTrue(os.path.isdir(lock_path))
+
+    def test_stale_lock_is_broken_and_write_succeeds(self):
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        old = time.time() - 3600
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "after stale lock",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("after stale lock", read_text(state_path(self.dir)))
+        self.assertFalse(os.path.isdir(lock_path))
+
+    # v1.1: init installs the pointer line and gitignores .statecat/.
+    def test_init_creates_agents_md_with_pointer_and_gitignore(self):
+        result = run_cli(self.dir, "init", "Pointer Project")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("created AGENTS.md with pointer", result.stdout)
+        self.assertIn("created .gitignore with .statecat/", result.stdout)
+        agents = read_text(os.path.join(self.dir, "AGENTS.md"))
+        self.assertIn("Read STATE.md first", agents)
+        gitignore = read_text(os.path.join(self.dir, ".gitignore"))
+        self.assertIn(".statecat/", gitignore)
+
+    def test_init_appends_pointer_to_existing_agents_md_without_duplicating(self):
+        with open(os.path.join(self.dir, "AGENTS.md"), "w", encoding="utf-8") as handle:
+            handle.write("# My instructions\n")
+        self.init_project()
+        agents = read_text(os.path.join(self.dir, "AGENTS.md"))
+        self.assertIn("Read STATE.md first", agents)
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pointer already in AGENTS.md", result.stdout)
+        agents = read_text(os.path.join(self.dir, "AGENTS.md"))
+        self.assertEqual(agents.count("Read STATE.md first"), 1)
+
+    def test_init_uses_claude_md_when_only_it_exists(self):
+        with open(os.path.join(self.dir, "CLAUDE.md"), "w", encoding="utf-8") as handle:
+            handle.write("# Claude notes\n")
+        self.init_project()
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+        self.assertIn("Read STATE.md first", read_text(os.path.join(self.dir, "CLAUDE.md")))
+
+    def test_init_no_pointer_and_no_gitignore_flags_skip(self):
+        result = run_cli(self.dir, "init", "Bare Project", "--no-pointer", "--no-gitignore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".gitignore")))
+
+    def test_pointer_prints_the_line(self):
+        result = run_cli(self.dir, "pointer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.")
+
+    # v1.1: show --json, status, search.
+    def test_show_json_is_machine_readable(self):
+        self.init_project("Json Project")
+        run_cli(self.dir, "add", "Decided", "Ship it")
+        run_cli(self.dir, "add", "Open", "Test it")
+        result = run_cli(self.dir, "show", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["project"], "Json Project")
+        self.assertEqual(data["last_id"], 2)
+        self.assertEqual([item["text"] for item in data["buckets"]["Decided"]], ["Ship it"])
+        self.assertEqual([item["id"] for item in data["buckets"]["Open"]], [2])
+        self.assertEqual(data["buckets"]["Parked"], [])
+
+    def test_show_json_single_bucket(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "One item")
+        result = run_cli(self.dir, "show", "Open", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(list(data["buckets"]), ["Open"])
+        self.assertEqual(len(data["buckets"]["Open"]), 1)
+
+    def test_status_summary(self):
+        self.init_project("Status Project")
+        run_cli(self.dir, "add", "Decided", "Done")
+        run_cli(self.dir, "add", "Open", "Doing")
+        result = run_cli(self.dir, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("StateCat status: Status Project", result.stdout)
+        self.assertIn("Decided: 1", result.stdout)
+        self.assertIn("Open: 1", result.stdout)
+        self.assertIn("Last ID used: #2", result.stdout)
+        self.assertIn("check: clean", result.stdout)
+
+    def test_search_finds_text_and_reports_no_match(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Bake the test batch")
+        run_cli(self.dir, "add", "Open", "Buy flour")
+        result = run_cli(self.dir, "search", "BAKE")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Bake the test batch", result.stdout)
+        self.assertNotIn("Buy flour", result.stdout)
+        result = run_cli(self.dir, "search", "nothing here")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no matches", result.stdout)
+
+    # v1.1: --version and packaging files.
+    def test_version_flag(self):
+        result = run_cli(self.dir, "--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.1.0"))
+
+    def test_packaging_and_ci_files_exist(self):
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
+        self.assertIn("statecat = \"statecat:main\"", read_text(os.path.join(ROOT, "pyproject.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "CHANGELOG.md")))
+        self.assertIn("1.1.0", read_text(os.path.join(ROOT, "CHANGELOG.md")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, "CONTRIBUTING.md")))
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, ".github", "workflows", "test.yml")))
+        self.assertIn("unittest discover", read_text(os.path.join(ROOT, ".github", "workflows", "test.yml")))
+
+    # v1.1: compact, config, stale Waiting on others.
+    def backdate_item(self, item_id, new_date):
+        text = read_text(state_path(self.dir))
+        text = re.sub(
+            r"(- #%d \[)[0-9-]+(\*?\] )" % item_id,
+            lambda match: match.group(1) + new_date + match.group(2),
+            text,
+            count=1,
+        )
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+
+    def test_compact_archives_old_decided_only(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "Old decision")
+        run_cli(self.dir, "add", "Decided", "Fresh decision")
+        run_cli(self.dir, "add", "Open", "Old open item")
+        self.backdate_item(1, "2026-01-01")
+        self.backdate_item(3, "2026-01-01")
+        result = run_cli(self.dir, "compact", "--older-than", "90", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would archive #1", result.stdout)
+        self.assertNotIn("would archive #2", result.stdout)
+        self.assertNotIn("would archive #3", result.stdout)
+        self.assertIn("Old decision", read_text(state_path(self.dir)))
+        result = run_cli(self.dir, "compact", "--older-than", "90")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("archived #1", result.stdout)
+        state_text = read_text(state_path(self.dir))
+        self.assertNotIn("Old decision", state_text)
+        self.assertIn("Fresh decision", state_text)
+        self.assertIn("Old open item", state_text)
+        self.assertIn("Old decision", read_text(archive_path(self.dir)))
+        result = run_cli(self.dir, "compact", "--older-than", "90")
+        self.assertIn("nothing to compact", result.stdout)
+
+    def test_config_show_and_set(self):
+        self.init_project()
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(config["stale_days"], 14)
+        self.assertEqual(config["backups_kept"], 20)
+        result = run_cli(self.dir, "config", "set", "stale_days", "30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("set stale_days = 30", result.stdout)
+        config = json.loads(run_cli(self.dir, "config").stdout)
+        self.assertEqual(config["stale_days"], 30)
+        self.assertEqual(config["backups_kept"], 20)
+        result = run_cli(self.dir, "config", "set", "nope", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown config key", result.stderr)
+        result = run_cli(self.dir, "config", "set", "stale_days", "abc")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a valid value", result.stderr)
+
+    def test_stale_waiting_on_others_and_config_stale_days(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Waiting on others", "Vendor reply")
+        self.backdate_item(1, "2026-01-01")
+        result = run_cli(self.dir, "check")
+        self.assertIn("stale: #1 in Waiting on others", result.stdout)
+        run_cli(self.dir, "config", "set", "stale_days", "100000")
+        result = run_cli(self.dir, "check")
+        self.assertNotIn("stale:", result.stdout)
+        run_cli(self.dir, "config", "set", "stale_days", "0")
+        result = run_cli(self.dir, "check")
+        self.assertIn("stale: #1 in Waiting on others", result.stdout)
+
+    # v1.1: diff and restore verification.
+    def test_diff_shows_change_then_no_differences_after_restore(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Diff me")
+        result = run_cli(self.dir, "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("+", result.stdout)
+        self.assertIn("Diff me", result.stdout)
+        self.assertIn("STATE.md", result.stdout)
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(self.dir, "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no differences", result.stdout)
+
+    def test_restore_of_broken_snapshot_warns(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Good item")
+        broken = os.path.join(self.dir, ".statecat", "backups", "20260101T000000000000")
+        os.makedirs(broken)
+        broken_state = read_text(state_path(self.dir)).replace("## Open\n", "", 1)
+        with open(os.path.join(broken, "STATE.md"), "w", encoding="utf-8", newline="") as handle:
+            handle.write(broken_state)
+        shutil.copy(archive_path(self.dir), os.path.join(broken, "STATE-ARCHIVE.md"))
+        result = run_cli(self.dir, "restore", "20260101T000000000000")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("restored 20260101T000000000000", result.stdout)
+        self.assertIn("warning: restored files have structural problems", result.stdout)
+        self.assertIn("problem:", result.stdout)
+
+    # v1.1: parser tolerance, set_last_id fix, archive warnings.
+    def test_item_without_space_after_date_bracket_parses(self):
+        self.init_project()
+        text = read_text(state_path(self.dir))
+        text = text.replace("## Open\n", "## Open\n- #1 [2026-10-24]No space here\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "show", "Open", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["buckets"]["Open"][0]["id"], 1)
+        self.assertEqual(data["buckets"]["Open"][0]["date"], "2026-10-24")
+        self.assertEqual(data["buckets"]["Open"][0]["text"], "No space here")
+        result = run_cli(self.dir, "check")
+        self.assertNotIn("has no date", result.stdout)
+
+    def test_check_fix_inserts_last_id_line_once(self):
+        self.init_project()
+        text = read_text(state_path(self.dir))
+        text = "\n".join(
+            line for line in text.splitlines() if not line.startswith("> Last ID used:")
+        ) + "\n"
+        text = text.replace("## Open\n", "## Open\n- Bare one\n- Bare two\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fixed = read_text(state_path(self.dir))
+        self.assertEqual(fixed.count("Last ID used:"), 1)
+        self.assertIn("Last ID used: #2", fixed)
+        self.assertIn("- #1 ", fixed)
+        self.assertIn("- #2 ", fixed)
+
+    def test_archive_items_get_missing_id_and_date_warnings(self):
+        self.init_project()
+        text = read_text(archive_path(self.dir))
+        text = text.replace("## Archived\n", "## Archived\n- Hand-archived note\n", 1)
+        with open(archive_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no ID", result.stdout)
+        self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no date", result.stdout)
 
 
 

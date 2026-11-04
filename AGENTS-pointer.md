@@ -6,6 +6,11 @@ StateCat, because it sits where every agent session starts. The
 skill alone is advisory and may not fire, so this pointer carries
 both steps.
 
+`init` installs the line automatically (into AGENTS.md, or
+CLAUDE.md when that is the file the project already has), and
+`pointer --install` adds it to an existing project. Copy it by
+hand only when neither command is available.
+
 ```text
 Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
 ```

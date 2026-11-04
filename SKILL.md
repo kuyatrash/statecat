@@ -13,7 +13,9 @@ A project using StateCat has this line in its agent instructions file
 
 That pointer is the real read-first and session-start check mechanism.
 This skill is supporting detail, not the trigger, because skills are
-advisory and may not fire.
+advisory and may not fire. `init` installs the line into AGENTS.md
+(or CLAUDE.md) for new projects; `pointer --install` adds it to an
+existing project, and `pointer` just prints it.
 
 ## Session workflow
 
@@ -26,6 +28,9 @@ advisory and may not fire.
    as the one allowed mention of a stale Waiting on human item for
    the session (see "Waiting is not nagging" below). On Windows,
    `python3` often is not on PATH; use `py` or `python` instead.
+   `show --json` is the machine-readable alternative to `show` when
+   you would rather parse JSON than Markdown, and `status` is the
+   compact one-line-per-fact summary.
 3. Summarise open work and human-owned moves only when that helps
    the conversation.
 4. The moment a decision changes, update the file before moving on.
@@ -77,6 +82,14 @@ advisory and may not fire.
 - To move an item, move it between buckets. Never duplicate it.
   An item lives in exactly one bucket at a time.
 - A move or an update stamps today's date on the item.
+- `search <text>` finds items by case-insensitive text, with
+  `--archive` to include archived items. `compact` archives
+  Decided items older than N days (default 90) with `--dry-run` to
+  preview; it never touches live buckets. `diff` shows the unified
+  diff between a snapshot and the current files. `.statecat/config`
+  (JSON) tunes stale days, size budget, backup count, and lock
+  timing; `config` prints the effective settings, `config set`
+  changes one key.
 
 ## Parked: soft protection, admitted
 
@@ -135,8 +148,13 @@ is calling it, and a hand edit bypasses it entirely.
   default target is the most recent pre-write snapshot. A snapshot
   taken to protect a restore is a safety snapshot, listed as
   such, and is never the default target, so restoring twice does
-  not flip back.
-- One writer at a time in v1.
+  not flip back. After a restore, the CLI verifies the restored
+  files and warns when they have structural problems.
+- One writer at a time, enforced: writes run under a
+  cross-platform lock directory (`.statecat/lock`). A second
+  writer waits up to 10 seconds, then fails cleanly and changes
+  nothing. A lock left behind by a crashed process is broken
+  after 60 seconds. Read-only commands do not take the lock.
 
 ## Manual rules: no CLI available
 
