@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.1: one living project state, readable by any agent in one read.
+"""StateCat v1.1.1: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -78,7 +78,7 @@ import tempfile
 import time
 from datetime import date
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -506,13 +506,19 @@ def fail_cleanly(message):
 
 
 def atomic_write(path, lines):
-    """Write lines ([content, ending] pairs) atomically: temp, then rename."""
+    """Write lines ([content, ending] pairs) atomically: temp, then rename.
+
+    The temp file from mkstemp is mode 0600; chmod it to 0644
+    before the rename, so the state files stay readable by any
+    user or agent account on the machine, which is the point of
+    keeping state in plain Markdown."""
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="") as out:
             for content, ending in lines:
                 out.write(content + ending)
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -523,11 +529,14 @@ def atomic_write(path, lines):
 
 
 def atomic_write_bytes(path, data):
+    """Write bytes atomically: temp, then rename. See atomic_write
+    for why the temp file is chmodded to 0644 first."""
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
         with os.fdopen(handle, "wb") as out:
             out.write(data)
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -1536,7 +1545,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.1: one living project state, readable by any agent "
+            "StateCat v1.1.1: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )

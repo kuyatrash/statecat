@@ -216,6 +216,8 @@ archive file, or recreate it from `templates/STATE-ARCHIVE.md`.
 The CLI never reformats lines it is not changing, so your hand
 edits survive. Files are opened with `newline=""`, so line
 endings are preserved byte-for-byte, including on Windows.
+State files are written with mode 0644 (world-readable), so
+other user or agent accounts on the same machine can read them.
 
 ## Un-parking with owner approval
 

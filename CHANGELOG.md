@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1 — 2026-11-04
+
+Fixed:
+
+- `STATE.md` and `STATE-ARCHIVE.md` were written with mode 0600,
+  because the temp files from `mkstemp` keep that mode. Another
+  user, container, or agent account could not read them, which
+  cuts against "readable by any agent." Atomic writes now chmod
+  the temp file to 0644 before the rename, for both the text and
+  byte writers (so `restore` is covered too). Two tests cover it.
+
 ## 1.1.0 — 2026-11-04
 
 Fixed:

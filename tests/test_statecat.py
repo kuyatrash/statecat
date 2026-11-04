@@ -810,7 +810,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.1.0"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.1.1"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
@@ -962,6 +962,25 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "check")
         self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no ID", result.stdout)
         self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no date", result.stdout)
+
+    # v1.1.1: state files are written world-readable (0644), not 0600.
+    def test_state_files_are_world_readable(self):
+        self.init_project()
+        for path in (state_path(self.dir), archive_path(self.dir)):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+        run_cli(self.dir, "add", "Open", "Written by add")
+        for path in (state_path(self.dir), archive_path(self.dir)):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+
+    def test_restore_leaves_files_world_readable(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Before restore")
+        os.chmod(state_path(self.dir), 0o600)
+        os.chmod(archive_path(self.dir), 0o600)
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in (state_path(self.dir), archive_path(self.dir)):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
 
 
 
