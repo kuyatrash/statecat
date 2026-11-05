@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Pinned to 24.04 on purpose: ubuntu-latest is moving to 26.04,
+    # and the setup-python manifest has no Python 3.8 or 3.9 build
+    # for 26.04, so the 3.8 job would fail there with "version not
+    # found". 24.04 has builds for the whole 3.8-3.12 matrix.
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests
+      - run: pip install -e .
+      - run: statecat --version
