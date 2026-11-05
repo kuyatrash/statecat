@@ -156,13 +156,20 @@ is calling it, and a hand edit bypasses it entirely.
 - One writer at a time, enforced: writes run under a
   cross-platform lock directory (`.statecat/lock`). A second
   writer waits up to 10 seconds, then fails cleanly and changes
-  nothing. A lock left behind by a crashed process is broken
+  nothing; the error names the owner PID, the lock age, the
+  stale limit, when the lock is expected to clear, and how to
+  clear it by hand (remove `.statecat/lock`, only if no writer
+  is actually running). A lock left behind by a crashed process is broken
   after 60 seconds, but only when its owner is proved dead: the owner
   PID in the lock's owner file is checked, a live owner is
   never deleted however old the lock looks, and unknown
   ownership is not treated as dead -- a lock with no owner
   file, or an indeterminate liveness check, is only broken
-  after ten times the stale limit. A heartbeat
+  after ten times the stale limit. On Windows the liveness
+  check is never run: signal.CTRL_C_EVENT is literally 0 there,
+  so os.kill(pid, 0) would send Ctrl+C to the process group
+  instead of probing, so Windows liveness is always unknown.
+  A heartbeat
   keeps a held lock's directory fresh while its writer works,
   and the owner file is created exclusively, so a writer whose
   lock directory was replaced can never write its token into

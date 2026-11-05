@@ -340,8 +340,12 @@ same Last ID used, assigned the same next ID, and the last write
 won. Writes now run under a cross-platform lock directory
 (`.statecat/lock`), held from before the first read until after
 the last write. A second writer waits up to 10 seconds, then
-fails cleanly with "the lock is held" and changes nothing. A lock
-left behind by a crashed process is broken after 60 seconds.
+fails cleanly with "the lock is held" and changes nothing. The
+error names the owner PID, the lock age, the stale limit, when
+the lock is expected to clear, and how to clear it by hand
+(remove `.statecat/lock`, only if no writer is actually
+running). A lock left behind by a crashed process is broken
+after 60 seconds.
 The lock carries a random owner token. Release and stale removal
 never check-then-delete in place: they rename the lock directory
 aside first (atomic), verify the token or the age on the renamed
@@ -374,7 +378,11 @@ process after the owner dies, and that strands the lock --
 the liveness check reports the reused PID as alive, so the
 lock is treated as live until that process exits, and the
 heartbeat does not fix it, because the original owner's
-heartbeat died with it. A writer that
+heartbeat died with it. On Windows the liveness check is never
+run at all: signal.CTRL_C_EVENT is literally 0 there, so
+os.kill(pid, 0) would send Ctrl+C to the process group instead
+of probing, so Windows liveness is always unknown and a Windows
+lock is only broken after ten times the stale limit. A writer that
 cannot record its owner token fails cleanly instead of
 proceeding unwitnessed, and deletes nothing: the directory
 at the lock path may already be a replacement writer's lock,

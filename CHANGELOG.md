@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.2.0 — 2026-11-04
+
+Lock correctness round and review fixes, built up in stages P0–P5
+after an external review of v1.1.1. The suite grew from 66 tests
+to 90.
+
+Fixed:
+
+- P0: lock ownership token (PID + uuid, release only if the token
+  matches); config validation with clear errors and a warning on
+  malformed JSON; invalid UTF-8 fails cleanly instead of a
+  traceback; `check --fix` restores a deleted Last ID line;
+  `restore` validates both snapshot files before overwriting and
+  stages the pair; `add` rejects empty text; unknown buckets, IDs
+  and snapshot names now list the valid values.
+- P1: lock release and stale removal rename the lock directory
+  aside first, then re-verify the token or age on the renamed copy,
+  so a writer can no longer delete a new owner's lock; an
+  owner-write failure fails cleanly instead of proceeding;
+  config rejects non-finite numbers (nan, inf) and booleans for
+  numeric keys.
+- P2: stale locks prove abandonment, not just age -- the owner PID
+  is checked for liveness (`os.kill(pid, 0)`) and a daemon
+  heartbeat keeps a held lock's directory fresh; env overrides
+  get the full config range validation; `lock_stale` must be
+  greater than `lock_timeout` in `config set` and JSON config.
+- P3: unknown ownership is not dead -- a lock with no owner file,
+  or an indeterminate liveness check, is only broken after ten
+  times the stale limit; the owner file is created exclusively
+  (mode "x"), so a resumed writer can never overwrite a
+  replacement owner's token.
+- P4: a writer that fails to write its owner file deletes
+  nothing, instead of renaming and deleting whatever directory
+  sits at the lock path; the other rename/delete sites were
+  audited and clear (stale-break and release decide on isolated
+  renamed copies).
+- P5: the lock-held error now names the owner PID, the lock age,
+  the stale limit, when the lock is expected to clear, and how to
+  clear it by hand; the PID liveness probe is never run on
+  Windows, where `os.kill(pid, 0)` would send Ctrl+C to the
+  process group instead of probing, so Windows liveness is
+  always unknown.
+
+Behaviour changes:
+
+- `config set` now rejects values it used to accept: out-of-range
+  numbers, non-finite numbers (nan, inf, -inf) and booleans for
+  numeric keys, and a `lock_stale` that is not greater than
+  `lock_timeout` (env overrides only warn on that pair).
+- `add` now rejects empty or whitespace-only text.
+
+Known limitations, stated honestly:
+
+- A PID recorded in the owner file can be reused by an unrelated
+  process after the owner dies, and that strands the lock until
+  that process exits; the heartbeat does not fix it.
+- The ten-times stale limit for unknown ownership is a
+  heuristic, not a proof: a writer suspended longer than that
+  between creating the lock directory and writing its owner
+  file could still lose its lock.
+- The restore check (lexists) and rename are two steps, so a
+  lock directory created in exactly that window could still be
+  replaced on POSIX; exclusive owner-file creation arbitrates
+  that case, so only one writer can claim the resulting
+  directory.
+- The heartbeat checks the owner token and then touches the
+  lock directory in two steps, so it can refresh a successor's
+  directory once; it never deletes anything.
+- A failed owner-file write leaves an ownerless directory
+  behind, which strands the project until it ages past ten
+  times the stale limit (600 seconds at defaults).
+
 ## 1.1.1 — 2026-11-04
 
 Fixed:

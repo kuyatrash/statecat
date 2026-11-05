@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.1.1: one living project state, readable by any agent in one read.
+"""StateCat v1.2.0: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -81,7 +81,7 @@ import time
 import uuid
 from datetime import date
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -577,15 +577,28 @@ def backup_root(directory):
     return os.path.join(directory, BACKUP_ROOT)
 
 
+def _format_seconds(value):
+    """A duration in whole seconds, e.g. 60 -> "60s"."""
+    return "%ds" % int(round(value))
+
+
 def _pid_is_alive(pid):
     """True if pid exists, False if definitely dead, None if unknown.
 
-    os.kill(pid, 0) does not send a signal; it only checks
-    existence. ProcessLookupError means dead, PermissionError
-    means a process exists that we may not signal, and any
-    other OSError (including platforms where signal 0 is not
-    meaningful) means liveness cannot be established here.
+    On POSIX, os.kill(pid, 0) does not send a signal; it only
+    checks existence. ProcessLookupError means dead,
+    PermissionError means a process exists that we may not
+    signal, and any other OSError means liveness cannot be
+    established here. On Windows this probe must never run:
+    signal.CTRL_C_EVENT is literally 0 there, so os.kill(pid, 0)
+    would call GenerateConsoleCtrlEvent and send Ctrl+C to the
+    process group instead of probing. Windows therefore always
+    returns None (unknown): a Windows lock is only broken after
+    the unknown-owner second threshold, ten times the stale
+    limit, because its owner's liveness cannot be established.
     """
+    if sys.platform == "win32":
+        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -689,7 +702,12 @@ class project_lock:
     for longer than ten times the stale limit between mkdir
     and its owner write could still lose its lock, and the
     exclusive owner-file create is what keeps that case
-    from corrupting the replacement owner's lock.
+    from corrupting the replacement owner's lock. On Windows
+    the PID liveness probe is never run at all: signal.CTRL_C_EVENT
+    is literally 0 there, so os.kill(pid, 0) would send Ctrl+C to
+    the process group instead of probing, so Windows liveness is
+    always unknown and a Windows lock is only broken after the
+    ten-times stale limit for unknown ownership.
     """
 
     def __init__(self, directory):
@@ -792,6 +810,51 @@ class project_lock:
             return time.time() - os.path.getmtime(self.lock_path)
         except OSError:
             return 0.0
+
+    def _lock_held_message(self, stale):
+        """Explain a lock that outlasted our wait, with numbers.
+
+        Names the owner PID (or "unknown"), the lock age, the
+        stale limit in use, and when the lock is expected to
+        clear under the same rules _is_abandoned_dir applies:
+        a proved-dead owner clears once the lock ages past
+        `stale`; an unknown owner (no owner file, or liveness
+        indeterminate, including always on Windows) clears once
+        it ages past ten times `stale`; a live owner never
+        clears while it is alive. Also says how to clear the
+        lock by hand, for when no writer is actually running.
+        """
+        pid = self._read_owner_pid_from(self.lock_path)
+        age = self._lock_age()
+        pid_text = str(pid) if pid is not None else "unknown"
+        if pid is None:
+            alive = None
+        else:
+            alive = _pid_is_alive(pid)
+        if alive is True:
+            clears = (
+                "never while the owner is alive "
+                "(owner PID %s is still running)" % pid
+            )
+        elif alive is False:
+            clears = "in about %d seconds, once the lock ages past the %s stale limit (the owner is dead)" % (
+                max(0, int(stale - age)),
+                _format_seconds(stale),
+            )
+        else:
+            limit = stale * UNKNOWN_OWNER_STALE_MULTIPLIER
+            clears = (
+                "in about %d seconds, once the lock ages past the %s unknown-owner limit "
+                "(10x the %s stale limit; the owner cannot be determined)"
+                % (max(0, int(limit - age)), _format_seconds(limit), _format_seconds(stale))
+            )
+        return (
+            "error: another statecat process is writing in this project; "
+            "the lock is held (owner PID %s, lock age %s, stale limit %s).\n"
+            "The lock should clear %s.\n"
+            "If no writer is actually running, remove the lock directory: rm -rf %s\n"
+            % (pid_text, _format_seconds(age), _format_seconds(stale), clears, self.lock_path)
+        )
 
     def _read_owner_token_from(self, directory):
         try:
@@ -966,10 +1029,7 @@ class project_lock:
                 # the rename/restore loop forever. A stale
                 # break is only attempted while time remains.
                 if time.monotonic() >= deadline:
-                    sys.stderr.write(
-                        "error: another statecat process is writing in this project; "
-                        "the lock is held. Try again in a moment.\n"
-                    )
+                    sys.stderr.write(self._lock_held_message(stale))
                     sys.stderr.write("No files were changed.\n")
                     sys.exit(1)
                 if self._lock_age() > stale:
@@ -2216,7 +2276,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.1.1: one living project state, readable by any agent "
+            "StateCat v1.2.0: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )

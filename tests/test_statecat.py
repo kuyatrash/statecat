@@ -823,7 +823,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.1.1"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.2.0"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
@@ -1605,6 +1605,92 @@ class StateCatTest(unittest.TestCase):
         # The replacement writer's lock survives untouched.
         self.assertTrue(os.path.isdir(lock_path))
         self.assertIn("replacement-owner-token", read_text(os.path.join(lock_path, "owner")))
+
+    def test_pid_is_alive_returns_unknown_on_windows_without_kill(self):
+        # On Windows, signal.CTRL_C_EVENT is literally 0, so
+        # os.kill(pid, 0) would send Ctrl+C to the process
+        # group instead of probing. The probe must never run
+        # there: liveness is always unknown on Windows.
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        with mock.patch.object(sys, "platform", "win32"):
+            with mock.patch("os.kill") as kill:
+                self.assertIsNone(statecat._pid_is_alive(1234))
+                self.assertIsNone(statecat._pid_is_alive(999999))
+            kill.assert_not_called()
+
+    def test_lock_held_error_names_dead_owner_pid_age_and_clear(self):
+        # The deadline error must say whose lock it is, how old
+        # it is, when it clears, and how to clear it by hand.
+        # A dead owner aged 30s at stale 60s is not broken yet,
+        # so the waiter times out and reports the numbers.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+            handle.write("token=dead-owner-token\n")
+        old = time.time() - 30
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by dead owner",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lock is held", result.stderr)
+        self.assertIn("owner PID 999999", result.stderr)
+        self.assertIn("stale limit 60s", result.stderr)
+        self.assertRegex(result.stderr, r"lock age \d+s")
+        match = re.search(r"in about (\d+) seconds", result.stderr)
+        self.assertIsNotNone(match, result.stderr)
+        # Aged ~30s at a 60s limit: about 30s left, give or take
+        # the half-second wait and clock skew.
+        self.assertTrue(20 <= int(match.group(1)) <= 35, result.stderr)
+        self.assertIn("rm -rf", result.stderr)
+        self.assertIn(lock_path, result.stderr)
+        self.assertTrue(os.path.isdir(lock_path))
+
+    def test_lock_held_error_for_live_owner_never_clears(self):
+        # A live owner never clears while it is alive, and the
+        # error must say so instead of promising a time.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=%d time=2026-11-04T00:00:00\n" % os.getpid())
+            handle.write("token=live-owner-token\n")
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by live owner",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("owner PID %d" % os.getpid(), result.stderr)
+        self.assertIn("never while the owner is alive", result.stderr)
+        self.assertIn("still running", result.stderr)
+
+    def test_lock_held_error_for_unknown_owner_uses_tenfold_limit(self):
+        # No owner file at all: unknown ownership, so the lock
+        # clears only after ten times the stale limit.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by ownerless lock",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("owner PID unknown", result.stderr)
+        self.assertIn("600s unknown-owner limit", result.stderr)
+        match = re.search(r"in about (\d+) seconds", result.stderr)
+        self.assertIsNotNone(match, result.stderr)
+        # Aged ~120s at a 600s limit: about 480s left.
+        self.assertTrue(460 <= int(match.group(1)) <= 490, result.stderr)
 
     def test_malformed_config_warns_and_uses_defaults(self):
         self.init_project()
