@@ -1,10 +1,45 @@
 # Changelog
 
+## Unreleased
+
+Follow-up fixes after the v1.2.0 release (not yet pushed; the
+workflow change needs a push from a real git client, as before).
+
+- `init` and `config set` now run under the project lock, like
+  the other writers: two agents init-ing the same empty
+  directory can no longer interleave and leave mismatched
+  project headers, and two simultaneous `config set` calls can
+  no longer lose one of the two settings.
+- Integer config keys reject fractional values instead of
+  truncating them: a JSON `{"stale_days": 1.9}` used to
+  silently become 1; it now warns and falls back to the
+  default, and `config set` rejects it. Integral values
+  (1.0, "5", "5.0") are still accepted.
+- The lock-held error is shell-quoted in its manual clear
+  command, so a project path with spaces pastes safely, and
+  on Windows it gives the PowerShell `Remove-Item -LiteralPath` command
+  instead of `rm -rf`, which is not a Windows command. A
+  dead owner is no longer introduced as "another process
+  writing": the error says the lock was left behind and no
+  process is writing. When the lock is under a second from
+  clearing, the error says it should clear on the next
+  attempt instead of "in about 0 seconds".
+- CI gains a Windows job (`windows-2022`, Python 3.11/3.12)
+  running the same suite, because the Ubuntu job cannot
+  exercise real Windows filesystem behaviour. It is untested
+  until GitHub Actions runs it; the Ubuntu job is unchanged
+  (ubuntu-24.04, Python 3.8-3.12).
+- The Windows manual clear command uses `-LiteralPath`, not
+  `-Path`, so a path with wildcard characters (square
+  brackets) is treated literally. A lock already past its
+  stale limit now says so instead of claiming the limit is
+  less than a second away.
+
 ## 1.2.0 — 2026-11-04
 
 Lock correctness round and review fixes, built up in stages P0–P5
 after an external review of v1.1.1. The suite grew from 66 tests
-to 90.
+to 94.
 
 Fixed:
 

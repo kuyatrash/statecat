@@ -319,6 +319,11 @@ out-of-range values with an error naming the valid range
 lock_stale 1-86400), and rejects non-finite numbers (nan, inf)
 and booleans outright: a JSON `true` is never coerced to 1,
 and a NaN lock timeout can never make a writer wait forever.
+Fractional values for integer keys are rejected the same way
+instead of being truncated: a JSON `{"stale_days": 1.9}` warns
+and falls back to the default rather than silently becoming 1,
+and `config set stale_days 1.9` errors; integral values (1.0,
+"5", "5.0") are still accepted.
 `lock_stale` must be greater than `lock_timeout`: `config set`
 rejects a pair that is not, and a JSON config stating such a
 pair warns and falls back to the defaults for both lock
@@ -339,13 +344,23 @@ Two writers at once used to silently lose an item: both read the
 same Last ID used, assigned the same next ID, and the last write
 won. Writes now run under a cross-platform lock directory
 (`.statecat/lock`), held from before the first read until after
-the last write. A second writer waits up to 10 seconds, then
-fails cleanly with "the lock is held" and changes nothing. The
-error names the owner PID, the lock age, the stale limit, when
-the lock is expected to clear, and how to clear it by hand
-(remove `.statecat/lock`, only if no writer is actually
-running). A lock left behind by a crashed process is broken
-after 60 seconds.
+the last write. That includes `init` and `config set`, which
+used to bypass the lock: two agents init-ing the same empty
+directory could interleave and leave mismatched project headers,
+and two simultaneous `config set` calls could lose one setting.
+A second writer waits up to 10 seconds, then fails cleanly and
+changes nothing. The error names the owner PID, the lock age, the
+stale limit, when the lock is expected to clear, and how to clear
+it by hand (remove `.statecat/lock`, only if no writer is actually
+running). The manual command is shell-quoted, so a project path
+with spaces pastes safely, and on Windows it is the PowerShell
+`Remove-Item -LiteralPath` command instead of `rm -rf`, which
+is not a Windows command. The wording follows the ownership
+state: a dead owner is not introduced as "another process
+writing" (no process is writing; the lock was left behind), and
+when the lock is under a second from clearing, the error says it
+should clear on the next attempt instead of "in about 0 seconds".
+A lock left behind by a crashed process is broken after 60 seconds.
 The lock carries a random owner token. Release and stale removal
 never check-then-delete in place: they rename the lock directory
 aside first (atomic), verify the token or the age on the renamed
@@ -389,6 +404,9 @@ at the lock path may already be a replacement writer's lock,
 and nothing proves it is still ours, so it is left for stale
 cleanup. A genuinely own directory left behind strands the
 project until it ages past ten times the stale limit.
+CI runs the suite on Ubuntu (Python 3.8-3.12) and on Windows
+(windows-2022, Python 3.11/3.12); the Windows job is new and
+untested until GitHub Actions runs it.
 Read-only commands (`show`, `check` without `--fix`, `search`,
 `status`, `diff`) do not take the lock.
 

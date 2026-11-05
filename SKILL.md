@@ -91,7 +91,11 @@ existing project, and `pointer` just prints it.
   timing; `config` prints the effective settings, `config set`
   changes one key and rejects out-of-range values with an error
   naming the valid range, and rejects non-finite numbers (nan,
-  inf) and booleans outright. A config file that is not valid JSON
+  inf) and booleans outright. Fractional values for integer
+  keys are rejected too, not truncated: a JSON
+  `{"stale_days": 1.9}` warns and falls back to the default,
+  and `config set` errors on it, while integral values
+  (1.0, "5", "5.0") are accepted. A config file that is not valid JSON
   warns and falls back to defaults.
 
 ## Parked: soft protection, admitted
@@ -154,12 +158,18 @@ is calling it, and a hand edit bypasses it entirely.
   not flip back. After a restore, the CLI verifies the restored
   files and warns when they have structural problems.
 - One writer at a time, enforced: writes run under a
-  cross-platform lock directory (`.statecat/lock`). A second
+  cross-platform lock directory (`.statecat/lock`), including
+  `init` and `config set`, which used to bypass it. A second
   writer waits up to 10 seconds, then fails cleanly and changes
   nothing; the error names the owner PID, the lock age, the
   stale limit, when the lock is expected to clear, and how to
   clear it by hand (remove `.statecat/lock`, only if no writer
-  is actually running). A lock left behind by a crashed process is broken
+  is actually running). The manual command is shell-quoted so
+  a path with spaces pastes safely, and on Windows it is the
+  PowerShell `Remove-Item -LiteralPath` command, not `rm -rf`. A dead owner
+  is worded as a lock left behind, not as a process writing,
+  and a sub-second countdown says the lock should clear on the
+  next attempt. A lock left behind by a crashed process is broken
   after 60 seconds, but only when its owner is proved dead: the owner
   PID in the lock's owner file is checked, a live owner is
   never deleted however old the lock looks, and unknown

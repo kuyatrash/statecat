@@ -73,6 +73,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -811,6 +812,23 @@ class project_lock:
         except OSError:
             return 0.0
 
+    def _manual_lock_clear_command(self):
+        """Shell command that removes this lock dir by hand.
+
+        POSIX: rm -rf with the path shell-quoted, so a project
+        path containing spaces or shell metacharacters pastes
+        safely. Windows: rm -rf is not a Windows command, so
+        give the PowerShell equivalent instead, with the path
+        single-quoted (a single quote in the path is doubled,
+        which is PowerShell's escape). Use -LiteralPath, not
+        -Path: -Path still interprets wildcards, so a path with
+        square brackets could match the wrong thing.
+        """
+        if sys.platform == "win32":
+            quoted = "'" + self.lock_path.replace("'", "''") + "'"
+            return "Remove-Item -LiteralPath %s -Recurse -Force" % quoted
+        return "rm -rf %s" % shlex.quote(self.lock_path)
+
     def _lock_held_message(self, stale):
         """Explain a lock that outlasted our wait, with numbers.
 
@@ -823,6 +841,18 @@ class project_lock:
         it ages past ten times `stale`; a live owner never
         clears while it is alive. Also says how to clear the
         lock by hand, for when no writer is actually running.
+
+        The opening is worded per ownership state: a dead
+        owner is not "another process writing" -- no process
+        is writing, the lock was left behind. A live owner
+        keeps the writing wording, and an unknown owner stays
+        neutral. When the remaining time is under a second,
+        the message says the lock should clear on the next
+        attempt instead of promising "in about 0 seconds":
+        int() would truncate a sub-second remainder to zero,
+        and the deadline is checked before another stale
+        break is attempted, so this attempt exits without
+        removing it and the next attempt does.
         """
         pid = self._read_owner_pid_from(self.lock_path)
         age = self._lock_age()
@@ -832,28 +862,80 @@ class project_lock:
         else:
             alive = _pid_is_alive(pid)
         if alive is True:
+            opening = (
+                "another statecat process is writing in this project; "
+                "the lock is held"
+            )
             clears = (
                 "never while the owner is alive "
                 "(owner PID %s is still running)" % pid
             )
         elif alive is False:
-            clears = "in about %d seconds, once the lock ages past the %s stale limit (the owner is dead)" % (
-                max(0, int(stale - age)),
-                _format_seconds(stale),
+            opening = (
+                "the lock was left behind by a statecat process that "
+                "is no longer running; no process is writing in this "
+                "project"
             )
+            remaining = stale - age
+            if remaining < 0:
+                # Already past the threshold: the deadline is
+                # checked before another stale break is attempted,
+                # so this attempt exits without removing the lock
+                # and the next attempt does the cleanup. Do not
+                # claim the limit is "less than a second away".
+                clears = (
+                    "on the next attempt, once the lock ages past the %s stale limit "
+                    "(the lock is already past the stale limit; try again now)"
+                    % _format_seconds(stale)
+                )
+            elif remaining < 1.0:
+                # Less than a second left would print as "in about
+                # 0 seconds" (int() truncates), and this attempt
+                # exits without removing the lock anyway: the
+                # deadline is checked before another stale break
+                # is attempted, so the next attempt does the
+                # cleanup. Say that instead of promising zero.
+                clears = (
+                    "on the next attempt, once the lock ages past the %s stale limit "
+                    "(the stale limit is less than a second away; try again now)"
+                    % _format_seconds(stale)
+                )
+            else:
+                clears = (
+                    "in about %d seconds, once the lock ages past the %s stale limit "
+                    "(the owner is dead)"
+                    % (int(remaining), _format_seconds(stale))
+                )
         else:
-            limit = stale * UNKNOWN_OWNER_STALE_MULTIPLIER
-            clears = (
-                "in about %d seconds, once the lock ages past the %s unknown-owner limit "
-                "(10x the %s stale limit; the owner cannot be determined)"
-                % (max(0, int(limit - age)), _format_seconds(limit), _format_seconds(stale))
+            opening = (
+                "the lock is held by a statecat process whose owner "
+                "cannot be determined; no process is known to be writing"
             )
+            limit = stale * UNKNOWN_OWNER_STALE_MULTIPLIER
+            remaining = limit - age
+            if remaining < 0:
+                clears = (
+                    "on the next attempt, once the lock ages past the %s unknown-owner limit "
+                    "(10x the %s stale limit; the lock is already past the limit; try again now)"
+                    % (_format_seconds(limit), _format_seconds(stale))
+                )
+            elif remaining < 1.0:
+                clears = (
+                    "on the next attempt, once the lock ages past the %s unknown-owner limit "
+                    "(10x the %s stale limit; the limit is less than a second away; try again now)"
+                    % (_format_seconds(limit), _format_seconds(stale))
+                )
+            else:
+                clears = (
+                    "in about %d seconds, once the lock ages past the %s unknown-owner limit "
+                    "(10x the %s stale limit; the owner cannot be determined)"
+                    % (int(remaining), _format_seconds(limit), _format_seconds(stale))
+                )
         return (
-            "error: another statecat process is writing in this project; "
-            "the lock is held (owner PID %s, lock age %s, stale limit %s).\n"
+            "error: %s (owner PID %s, lock age %s, stale limit %s).\n"
             "The lock should clear %s.\n"
-            "If no writer is actually running, remove the lock directory: rm -rf %s\n"
-            % (pid_text, _format_seconds(age), _format_seconds(stale), clears, self.lock_path)
+            "If no writer is actually running, remove the lock directory: %s\n"
+            % (opening, pid_text, _format_seconds(age), _format_seconds(stale), clears, self._manual_lock_clear_command())
         )
 
     def _read_owner_token_from(self, directory):
@@ -1178,6 +1260,44 @@ CONFIG_RANGES = {
 }
 
 
+def _coerce_config_value(key, raw):
+    """Coerce a config value to its declared type, or raise ValueError.
+
+    Integer keys reject fractional values instead of truncating
+    them: int(1.9) is 1 in Python, so a JSON {"stale_days": 1.9}
+    used to silently become 1. Integral floats (1.0) and
+    integral strings ("5", "5.0") are accepted; anything
+    fractional, non-finite, or non-numeric raises ValueError.
+    Booleans are rejected too (int(True) is 1). Float keys
+    take float(raw), so "nan"/"inf" still parse there and are
+    caught downstream by config_range_error's finiteness check.
+    Env overrides only cover the two float lock keys, so no
+    integer truncation can happen on that path.
+    """
+    caster = CONFIG_KEYS[key]
+    if isinstance(raw, bool):
+        raise ValueError("a boolean is not a valid value for %s" % key)
+    if caster is int:
+        if isinstance(raw, float):
+            if not math.isfinite(raw) or raw != int(raw):
+                raise ValueError(
+                    "%r is not an integer value for %s" % (raw, key)
+                )
+            return int(raw)
+        if isinstance(raw, str):
+            try:
+                return int(raw.strip())
+            except ValueError:
+                number = float(raw.strip())
+                if not math.isfinite(number) or number != int(number):
+                    raise ValueError(
+                        "%r is not an integer value for %s" % (raw, key)
+                    )
+                return int(number)
+        return int(raw)
+    return caster(raw)
+
+
 def config_range_error(key, value):
     """Return an error string when value is outside its range, else None.
 
@@ -1251,12 +1371,12 @@ def load_config(directory):
                         )
                         continue
                     try:
-                        value = caster(raw[key])
-                    except (TypeError, ValueError, OverflowError):
+                        value = _coerce_config_value(key, raw[key])
+                    except (TypeError, ValueError, OverflowError) as exc:
                         warnings.append(
                             "warning: ignoring invalid value for %s in "
-                            ".statecat/config; using default %s"
-                            % (key, config[key])
+                            ".statecat/config (%s); using default %s"
+                            % (key, exc, config[key])
                         )
                         continue
                     range_error = config_range_error(key, value)
@@ -1310,9 +1430,12 @@ def cmd_config(args):
             )
             return 1
         try:
-            value = CONFIG_KEYS[key](args.value)
-        except (TypeError, ValueError):
-            sys.stderr.write("error: %r is not a valid value for %s\n" % (args.value, key))
+            value = _coerce_config_value(key, args.value)
+        except (TypeError, ValueError) as exc:
+            sys.stderr.write(
+                "error: %r is not a valid value for %s (%s)\n"
+                % (args.value, key, exc)
+            )
             return 1
         range_error = config_range_error(key, value)
         if range_error is not None:
@@ -2370,7 +2493,25 @@ def main(argv=None):
     # Write commands run whole read-modify-write cycles under the
     # project lock, so two writers cannot silently lose an item.
     # Read-only commands do not take the lock.
+    # init and config set are writers too, and used to bypass the
+    # lock: two agents init-ing the same empty directory could
+    # interleave and leave STATE.md and STATE-ARCHIVE.md with
+    # different project headers, and two simultaneous config
+    # sets could each read the same old JSON and lose the other.
+    # init has no STATE.md yet, so it cannot use require_root:
+    # its lock lives in .statecat/ under the current directory,
+    # which the lock creates itself, and the lock does not
+    # depend on the state files existing. The second init still
+    # fails cleanly inside the lock, once the first has created
+    # the files, instead of overwriting them.
     if args.command in ("add", "move", "update", "supersede", "archive", "compact"):
+        directory = require_root()
+        with project_lock(directory):
+            return args.func(args)
+    if args.command == "init":
+        with project_lock(os.getcwd()):
+            return args.func(args)
+    if args.command == "config" and getattr(args, "action", None) == "set":
         directory = require_root()
         with project_lock(directory):
             return args.func(args)

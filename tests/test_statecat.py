@@ -1639,7 +1639,8 @@ class StateCatTest(unittest.TestCase):
             "add", "Open", "blocked by dead owner",
         )
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("lock is held", result.stderr)
+        self.assertIn("left behind", result.stderr)
+        self.assertIn("no process is writing", result.stderr)
         self.assertIn("owner PID 999999", result.stderr)
         self.assertIn("stale limit 60s", result.stderr)
         self.assertRegex(result.stderr, r"lock age \d+s")
@@ -1691,6 +1692,188 @@ class StateCatTest(unittest.TestCase):
         self.assertIsNotNone(match, result.stderr)
         # Aged ~120s at a 600s limit: about 480s left.
         self.assertTrue(460 <= int(match.group(1)) <= 490, result.stderr)
+
+    # --- P6 fix round 2026-11-04 (ChatGPT v1.2.0 whole-repo review) ---
+
+    def test_concurrent_init_second_init_fails_and_headers_match(self):
+        # init used to bypass the project lock: two agents
+        # init-ing the same empty directory could both pass the
+        # existence check and interleave, leaving STATE.md and
+        # STATE-ARCHIVE.md with different project headers.
+        # Serialized under the lock, exactly one init wins and
+        # the pair of headers always agrees.
+        for _ in range(5):
+            with tempfile.TemporaryDirectory() as directory:
+                procs = [
+                    subprocess.Popen(
+                        [sys.executable, CLI, "init", name],
+                        cwd=directory, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    for name in ("Alpha", "Beta")
+                ]
+                results = [proc.communicate() for proc in procs]
+                codes = [proc.returncode for proc in procs]
+                self.assertEqual(sorted(codes), [0, 1], results)
+                loser = results[codes.index(1)]
+                self.assertIn("already exists", loser[1])
+                headers = set()
+                for path in (state_path(directory), archive_path(directory)):
+                    for line in read_lines(path):
+                        if line.startswith("# Project:"):
+                            header = line.strip()
+                            # The archive header is "<name> Archive";
+                            # removesuffix is 3.9+, so strip by hand.
+                            if header.endswith(" Archive"):
+                                header = header[: -len(" Archive")]
+                            headers.add(header)
+                self.assertEqual(len(headers), 1, headers)
+                self.assertIn(list(headers)[0], ("# Project: Alpha", "# Project: Beta"))
+
+    def test_concurrent_config_sets_both_survive(self):
+        # config set used to bypass the project lock: two
+        # simultaneous sets each read the same old JSON and the
+        # last atomic write won, losing the other key.
+        for _ in range(5):
+            with tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(run_cli(directory, "init", "Cfg").returncode, 0)
+                procs = [
+                    subprocess.Popen(
+                        [sys.executable, CLI, "config", "set", key, value],
+                        cwd=directory, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    for key, value in (("stale_days", "42"), ("backups_kept", "7"))
+                ]
+                for proc in procs:
+                    proc.communicate()
+                    self.assertEqual(proc.returncode, 0)
+                config = json.loads(run_cli(directory, "config").stdout)
+                self.assertEqual(config["stale_days"], 42)
+                self.assertEqual(config["backups_kept"], 7)
+
+    def test_config_file_rejects_fractional_integer_values(self):
+        # int(1.9) is 1 in Python, so a JSON {"stale_days": 1.9}
+        # used to silently become 1 with no warning at all.
+        # Fractional values for integer keys are now rejected
+        # with a clear warning and fall back to the default;
+        # integral values (1.0, "5", "5.0") still work.
+        self.init_project()
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write('{"stale_days": 1.9}')
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignoring", result.stderr)
+        self.assertIn("not an integer", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stale_days"], 14)
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write('{"stale_days": 1.0}')
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stale_days"], 1)
+        result = run_cli(self.dir, "config", "set", "stale_days", "1.9")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not an integer", result.stderr)
+        result = run_cli(self.dir, "config", "set", "stale_days", "5.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("set stale_days = 5", result.stdout)
+        self.assertEqual(json.loads(run_cli(self.dir, "config").stdout)["stale_days"], 5)
+
+    def test_lock_held_error_quotes_path_with_space_and_rewords_dead_owner(self):
+        # A project path with a space used to paste into the
+        # manual command unquoted (rm -rf .../My Projects/...),
+        # and a dead owner was still introduced as "another
+        # statecat process is writing", contradicting the
+        # "(the owner is dead)" that followed it.
+        with tempfile.TemporaryDirectory() as base:
+            directory = os.path.join(base, "My Projects")
+            os.makedirs(directory)
+            self.assertEqual(run_cli(directory, "init", "Spacey").returncode, 0)
+            lock_path = os.path.join(directory, ".statecat", "lock")
+            os.makedirs(lock_path)
+            with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+                handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+                handle.write("token=dead-owner-token\n")
+            old = time.time() - 30
+            os.utime(lock_path, (old, old))
+            result = run_cli_env(
+                directory, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+                "add", "Open", "blocked by dead owner",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("left behind", result.stderr)
+            self.assertIn("no process is writing", result.stderr)
+            self.assertNotIn("another statecat process is writing", result.stderr)
+            self.assertIn("rm -rf '%s'" % lock_path, result.stderr)
+
+    def test_lock_held_error_zero_second_countdown_says_next_attempt(self):
+        # When the remaining time is under a second, int()
+        # truncation used to print "in about 0 seconds", even
+        # though this attempt exits without removing the lock
+        # and the next attempt does the cleanup.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+            handle.write("token=dead-owner-token\n")
+        old = time.time() - 58.5
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by dead owner",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("in about 0 seconds", result.stderr)
+        self.assertIn("on the next attempt", result.stderr)
+
+    def test_lock_held_error_past_threshold_says_already_past(self):
+        # The sub-second branch also catches a lock already past
+        # the threshold (remaining is negative). It must not
+        # claim the limit is "less than a second away" then.
+        # Test the message directly: a live acquisition would
+        # break a dead lock this old instead of reporting it.
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+            handle.write("token=dead-owner-token\n")
+        old = time.time() - 65
+        os.utime(lock_path, (old, old))
+        lock = statecat.project_lock(self.dir)
+        message = lock._lock_held_message(60)
+        self.assertIn("on the next attempt", message)
+        self.assertIn("already past the stale limit", message)
+        self.assertNotIn("less than a second away", message)
+
+    def test_manual_lock_clear_command_is_powershell_on_windows(self):
+        # rm -rf is not a Windows command, so the manual clear
+        # instruction must not print it on Windows; it gives
+        # the PowerShell equivalent instead, with -LiteralPath:
+        # -Path would still interpret wildcards, so a path with
+        # square brackets could match the wrong thing.
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock = statecat.project_lock(os.path.join("/tmp", "My Projects"))
+        with mock.patch.object(sys, "platform", "win32"):
+            command = lock._manual_lock_clear_command()
+        self.assertIn("Remove-Item -LiteralPath", command)
+        self.assertIn("-Recurse -Force", command)
+        self.assertNotIn("rm -rf", command)
+        self.assertEqual(
+            command,
+            "Remove-Item -LiteralPath '/tmp/My Projects/.statecat/lock' -Recurse -Force",
+        )
+        # And on POSIX the same path is shell-quoted.
+        self.assertEqual(
+            lock._manual_lock_clear_command(),
+            "rm -rf '/tmp/My Projects/.statecat/lock'",
+        )
 
     def test_malformed_config_warns_and_uses_defaults(self):
         self.init_project()
