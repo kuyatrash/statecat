@@ -405,8 +405,12 @@ and nothing proves it is still ours, so it is left for stale
 cleanup. A genuinely own directory left behind strands the
 project until it ages past ten times the stale limit.
 CI runs the suite on Ubuntu (Python 3.8-3.12) and on Windows
-(windows-2022, Python 3.11/3.12); the Windows job is new and
-untested until GitHub Actions runs it.
+(windows-2022, Python 3.11/3.12). The Windows job's first run
+exposed Windows-only test assumptions (the Unix launcher, Unix
+file modes, unknown lock-owner liveness, CRLF fixture
+checkouts); the suite now skips or expects Windows behaviour
+for those, and the Windows job sets `fail-fast: false` so one
+version's failure does not cancel the other.
 Read-only commands (`show`, `check` without `--fix`, `search`,
 `status`, `diff`) do not take the lock.
 

@@ -1,0 +1,7 @@
+# StateCat is developed on Linux and Windows; force LF line endings
+# on checkout so every text file is identical on every platform.
+# Tests do line-based surgery on the fixture files, and a Windows
+# checkout with CRLF would silently break replacements anchored
+# on "\n" (that is how test_missing_heading_is_structural failed
+# on the first Windows CI run).
+* text=auto eol=lf

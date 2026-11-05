@@ -441,6 +441,11 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("e.g. 12", help_text)
         self.assertNotIn("e.g. #12", help_text)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "the launcher is a Unix shell script; Windows cannot "
+        "execute an extensionless file (WinError 193)",
+    )
     def test_launcher_forwards_to_script(self):
         launcher_src = os.path.join(ROOT, "statecat")
         self.assertTrue(os.path.isfile(launcher_src))
@@ -507,10 +512,14 @@ class StateCatTest(unittest.TestCase):
 
     def test_missing_heading_is_structural_and_not_recreated(self):
         self.copy_fixture()
-        text = read_text(state_path(self.dir))
-        text = text.replace("## Parked\n", "", 1)
+        # Remove the heading line by line, not by replacing
+        # "## Parked\n": on a Windows checkout the fixture may
+        # have CRLF endings, so the "\n"-anchored replace
+        # silently matches nothing and the heading stays.
+        lines = read_lines(state_path(self.dir))
+        lines = [line for line in lines if line.rstrip("\r\n") != "## Parked"]
         with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
+            handle.writelines(lines)
         result = run_cli(self.dir, "check")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing bucket heading", result.stdout)
@@ -982,6 +991,13 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no date", result.stdout)
 
     # v1.1.1: state files are written world-readable (0644), not 0600.
+    # Unix permission bits do not exist on Windows (st_mode is
+    # fabricated as 0666 for a writable file), so these two tests
+    # only run where the mode they assert can exist.
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Unix file mode bits do not exist on Windows",
+    )
     def test_state_files_are_world_readable(self):
         self.init_project()
         for path in (state_path(self.dir), archive_path(self.dir)):
@@ -990,6 +1006,10 @@ class StateCatTest(unittest.TestCase):
         for path in (state_path(self.dir), archive_path(self.dir)):
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Unix file mode bits do not exist on Windows",
+    )
     def test_restore_leaves_files_world_readable(self):
         self.init_project()
         run_cli(self.dir, "add", "Open", "Before restore")
@@ -1294,14 +1314,19 @@ class StateCatTest(unittest.TestCase):
     def test_stale_lock_with_live_owner_is_never_broken(self):
         # Age alone must not kill a live writer: an aged lock
         # whose owner PID is still alive is not abandoned,
-        # however old its directory looks.
+        # however old its directory looks. On Windows liveness
+        # is always unknown, so a lock is only held inside the
+        # ten-times stale window: age it 120s there (well
+        # inside 600s), not 3600s (past it, where Windows
+        # correctly breaks it as abandoned).
         self.init_project()
         lock_path = os.path.join(self.dir, ".statecat", "lock")
         os.makedirs(lock_path)
         with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
             handle.write("pid=%d time=2026-11-04T00:00:00\n" % os.getpid())
             handle.write("token=live-owner-token\n")
-        old = time.time() - 3600
+        age = 120 if sys.platform == "win32" else 3600
+        old = time.time() - age
         os.utime(lock_path, (old, old))
         result = run_cli_env(
             self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
@@ -1639,19 +1664,32 @@ class StateCatTest(unittest.TestCase):
             "add", "Open", "blocked by dead owner",
         )
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("left behind", result.stderr)
-        self.assertIn("no process is writing", result.stderr)
         self.assertIn("owner PID 999999", result.stderr)
         self.assertIn("stale limit 60s", result.stderr)
         self.assertRegex(result.stderr, r"lock age \d+s")
-        match = re.search(r"in about (\d+) seconds", result.stderr)
-        self.assertIsNotNone(match, result.stderr)
-        # Aged ~30s at a 60s limit: about 30s left, give or take
-        # the half-second wait and clock skew.
-        self.assertTrue(20 <= int(match.group(1)) <= 35, result.stderr)
-        self.assertIn("rm -rf", result.stderr)
         self.assertIn(lock_path, result.stderr)
         self.assertTrue(os.path.isdir(lock_path))
+        if sys.platform == "win32":
+            # Windows liveness is always unknown, so a dead PID
+            # is reported on the unknown-owner branch: ten
+            # times the stale limit, and the PowerShell manual
+            # command instead of rm -rf.
+            self.assertIn("cannot be determined", result.stderr)
+            self.assertIn("600s unknown-owner limit", result.stderr)
+            match = re.search(r"in about (\d+) seconds", result.stderr)
+            self.assertIsNotNone(match, result.stderr)
+            # Aged ~30s at a 600s limit: about 570s left.
+            self.assertTrue(555 <= int(match.group(1)) <= 585, result.stderr)
+            self.assertIn("Remove-Item -LiteralPath", result.stderr)
+        else:
+            self.assertIn("left behind", result.stderr)
+            self.assertIn("no process is writing", result.stderr)
+            match = re.search(r"in about (\d+) seconds", result.stderr)
+            self.assertIsNotNone(match, result.stderr)
+            # Aged ~30s at a 60s limit: about 30s left, give or take
+            # the half-second wait and clock skew.
+            self.assertTrue(20 <= int(match.group(1)) <= 35, result.stderr)
+            self.assertIn("rm -rf", result.stderr)
 
     def test_lock_held_error_for_live_owner_never_clears(self):
         # A live owner never clears while it is alive, and the
@@ -1670,12 +1708,26 @@ class StateCatTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("owner PID %d" % os.getpid(), result.stderr)
-        self.assertIn("never while the owner is alive", result.stderr)
-        self.assertIn("still running", result.stderr)
+        if sys.platform == "win32":
+            # Windows cannot tell a live owner from a dead one,
+            # so this lock is reported on the unknown-owner
+            # branch: it clears after ten times the stale limit,
+            # not never. Aged ~120s at a 600s limit: ~480s left.
+            self.assertIn("cannot be determined", result.stderr)
+            self.assertIn("600s unknown-owner limit", result.stderr)
+            match = re.search(r"in about (\d+) seconds", result.stderr)
+            self.assertIsNotNone(match, result.stderr)
+            self.assertTrue(460 <= int(match.group(1)) <= 490, result.stderr)
+        else:
+            self.assertIn("never while the owner is alive", result.stderr)
+            self.assertIn("still running", result.stderr)
 
     def test_lock_held_error_for_unknown_owner_uses_tenfold_limit(self):
         # No owner file at all: unknown ownership, so the lock
-        # clears only after ten times the stale limit.
+        # clears only after ten times the stale limit. This is
+        # the same branch on Windows and POSIX (Windows
+        # liveness is always unknown), so no platform branch
+        # is needed here.
         self.init_project()
         lock_path = os.path.join(self.dir, ".statecat", "lock")
         os.makedirs(lock_path)
@@ -1801,16 +1853,47 @@ class StateCatTest(unittest.TestCase):
                 "add", "Open", "blocked by dead owner",
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertIn("left behind", result.stderr)
-            self.assertIn("no process is writing", result.stderr)
-            self.assertNotIn("another statecat process is writing", result.stderr)
-            self.assertIn("rm -rf '%s'" % lock_path, result.stderr)
+            if sys.platform == "win32":
+                # Windows reports the dead PID on the
+                # unknown-owner branch, and the manual command
+                # is PowerShell, not rm -rf.
+                self.assertIn("cannot be determined", result.stderr)
+                self.assertIn(
+                    "Remove-Item -LiteralPath '%s'" % lock_path, result.stderr
+                )
+            else:
+                self.assertIn("left behind", result.stderr)
+                self.assertIn("no process is writing", result.stderr)
+                self.assertNotIn("another statecat process is writing", result.stderr)
+                self.assertIn("rm -rf '%s'" % lock_path, result.stderr)
 
     def test_lock_held_error_zero_second_countdown_says_next_attempt(self):
         # When the remaining time is under a second, int()
         # truncation used to print "in about 0 seconds", even
         # though this attempt exits without removing the lock
         # and the next attempt does the cleanup.
+        if sys.platform == "win32":
+            # On Windows the dead PID is reported on the
+            # unknown-owner branch, so the sub-second window
+            # sits at the tenfold limit. Check the message
+            # directly: through the CLI the lock would age
+            # past 600s during the half-second wait and be
+            # broken as abandoned instead of reported.
+            sys.path.insert(0, ROOT)
+            import statecat
+
+            lock_path = os.path.join(self.dir, ".statecat", "lock")
+            os.makedirs(lock_path)
+            with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+                handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+                handle.write("token=dead-owner-token\n")
+            old = time.time() - 599.5
+            os.utime(lock_path, (old, old))
+            lock = statecat.project_lock(self.dir)
+            message = lock._lock_held_message(60)
+            self.assertNotIn("in about 0 seconds", message)
+            self.assertIn("on the next attempt", message)
+            return
         self.init_project()
         lock_path = os.path.join(self.dir, ".statecat", "lock")
         os.makedirs(lock_path)
@@ -1841,12 +1924,18 @@ class StateCatTest(unittest.TestCase):
         with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
             handle.write("pid=999999 time=2026-11-04T00:00:00\n")
             handle.write("token=dead-owner-token\n")
-        old = time.time() - 65
+        old = time.time() - (665 if sys.platform == "win32" else 65)
         os.utime(lock_path, (old, old))
         lock = statecat.project_lock(self.dir)
         message = lock._lock_held_message(60)
         self.assertIn("on the next attempt", message)
-        self.assertIn("already past the stale limit", message)
+        if sys.platform == "win32":
+            # Windows reports the dead PID on the unknown-owner
+            # branch, so the threshold here is the tenfold
+            # limit, and the lock must be aged past that.
+            self.assertIn("already past the limit", message)
+        else:
+            self.assertIn("already past the stale limit", message)
         self.assertNotIn("less than a second away", message)
 
     def test_manual_lock_clear_command_is_powershell_on_windows(self):
@@ -1855,6 +1944,10 @@ class StateCatTest(unittest.TestCase):
         # the PowerShell equivalent instead, with -LiteralPath:
         # -Path would still interpret wildcards, so a path with
         # square brackets could match the wrong thing.
+        # Expectations are built from lock.lock_path, not
+        # hardcoded with forward slashes: on Windows
+        # os.path.join uses backslashes, so a hardcoded
+        # '/tmp/...' path never matches there.
         sys.path.insert(0, ROOT)
         import statecat
         from unittest import mock
@@ -1862,18 +1955,24 @@ class StateCatTest(unittest.TestCase):
         lock = statecat.project_lock(os.path.join("/tmp", "My Projects"))
         with mock.patch.object(sys, "platform", "win32"):
             command = lock._manual_lock_clear_command()
-        self.assertIn("Remove-Item -LiteralPath", command)
-        self.assertIn("-Recurse -Force", command)
-        self.assertNotIn("rm -rf", command)
         self.assertEqual(
             command,
-            "Remove-Item -LiteralPath '/tmp/My Projects/.statecat/lock' -Recurse -Force",
+            "Remove-Item -LiteralPath '%s' -Recurse -Force" % lock.lock_path,
         )
-        # And on POSIX the same path is shell-quoted.
-        self.assertEqual(
-            lock._manual_lock_clear_command(),
-            "rm -rf '/tmp/My Projects/.statecat/lock'",
-        )
+        self.assertNotIn("rm -rf", command)
+        # A path with square brackets must still be passed
+        # literally, which is what -LiteralPath is for.
+        bracketed = statecat.project_lock(os.path.join("/tmp", "My [Project]"))
+        with mock.patch.object(sys, "platform", "win32"):
+            command = bracketed._manual_lock_clear_command()
+        self.assertIn("Remove-Item -LiteralPath", command)
+        self.assertIn(bracketed.lock_path, command)
+        # And on POSIX the same path is shell-quoted. Mock the
+        # platform here too: on a real Windows runner the
+        # unmocked call would take the PowerShell branch.
+        with mock.patch.object(sys, "platform", "linux"):
+            command = lock._manual_lock_clear_command()
+        self.assertEqual(command, "rm -rf '%s'" % lock.lock_path)
 
     def test_malformed_config_warns_and_uses_defaults(self):
         self.init_project()

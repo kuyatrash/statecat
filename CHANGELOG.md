@@ -34,6 +34,30 @@ workflow change needs a push from a real git client, as before).
   brackets) is treated literally. A lock already past its
   stale limit now says so instead of claiming the limit is
   less than a second away.
+- P7: the first Windows CI run (windows-2022, Python
+  3.11/3.12) failed 10 tests and errored on 1, while all five
+  Ubuntu jobs passed. All 11 were Windows-only test
+  assumptions, not product bugs, and no product code changed:
+  the launcher test skips on Windows (the launcher is a Unix
+  shell script Windows cannot execute); the two
+  world-readable tests skip on Windows (Unix mode bits do not
+  exist there); the lock-held error tests now expect the
+  unknown-owner branch on Windows, where liveness is always
+  unknown (dead/live PIDs report after ten times the stale
+  limit, with the PowerShell manual command); the
+  missing-heading test no longer assumes LF fixture text (a
+  Windows checkout converts it to CRLF); the PowerShell
+  manual-command test builds its expectations from the real
+  joined path (backslashes on Windows) and mocks the platform
+  for both branches. The "could not write the lock ownership
+  file" lines in the Windows log are the two deliberate
+  error-path tests printing on every platform, not a Windows
+  bug. A `.gitattributes` now forces LF checkouts so fixture
+  line endings cannot drift by platform, and the Windows job
+  sets `fail-fast: false` so a 3.12 failure no longer cancels
+  the 3.11 run. Every Windows fix here is reasoned from the
+  failure summary plus code inspection; the next Actions run
+  is the real verification.
 
 ## 1.2.0 — 2026-11-04
 
