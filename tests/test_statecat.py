@@ -819,7 +819,12 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("1.1.0", read_text(os.path.join(ROOT, "CHANGELOG.md")))
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "CONTRIBUTING.md")))
         self.assertTrue(os.path.isfile(os.path.join(ROOT, ".github", "workflows", "test.yml")))
-        self.assertIn("unittest discover", read_text(os.path.join(ROOT, ".github", "workflows", "test.yml")))
+        workflow = read_text(os.path.join(ROOT, ".github", "workflows", "test.yml"))
+        self.assertIn("unittest discover", workflow)
+        # Pinned to 24.04: the setup-python manifest has no Python
+        # 3.8 build for Ubuntu 26.04, so ubuntu-latest would fail
+        # the 3.8 job once it moves to 26.04.
+        self.assertIn("ubuntu-24.04", workflow)
 
     # v1.1: compact, config, stale Waiting on others.
     def backdate_item(self, item_id, new_date):
