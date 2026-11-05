@@ -122,7 +122,8 @@ python3 statecat.py diff
 would rather parse JSON than Markdown. `status` prints a compact
 summary: bucket counts, stale waiting items, Last ID used, file
 size, and the check result. `search` finds items by
-case-insensitive text, with `--archive` to include archived items.
+case-insensitive text, with `--archive` to include archived items;
+when nothing matches it prints "no matches" and exits with code 1.
 `compact` archives Decided items older than N days (default 90),
 with `--dry-run` to preview; it never touches live buckets.
 `diff` shows the unified diff between a snapshot and the current
@@ -138,7 +139,7 @@ Shell quoting rule: in bash, an unquoted `#` starts a comment, so
 (`move 2 Open`) or quote the ID (`move "#2" Open`). The code
 accepts both `2` and `#2`. Item text must be a single line: text
 containing a newline or carriage return is rejected with no write
-and no backup taken.
+and no backup taken. Empty item text is rejected the same way.
 
 ## Optional launcher (Unix)
 
@@ -207,7 +208,8 @@ so it cannot silently strand text in the old bucket.
 
 If the "Last ID used" counter falls behind the highest ID in
 use, check warns about it, and `check --fix` raises the counter
-to that highest ID. If `STATE-ARCHIVE.md` is missing, or has no
+to that highest ID. If the "Last ID used" line itself is missing,
+`check --fix` restores it from the highest ID in use. If `STATE-ARCHIVE.md` is missing, or has no
 "## Archived" heading, check reports a structural problem and
 write commands refuse, instead of silently recreating a
 headerless archive file. Restore a snapshot containing the
@@ -259,6 +261,10 @@ running restore twice restores the same snapshot and does not
 flip back. You can still restore a safety snapshot by naming it
 explicitly. There is no single-file restore: restoring only
 `STATE.md` after a supersede would recreate a duplicate ID.
+`restore` validates the snapshot before overwriting anything:
+both files must be present and valid UTF-8, otherwise it refuses
+with a clean error and changes nothing. A bad snapshot name
+prints the available snapshots.
 
 After a restore, the CLI verifies the restored files and warns
 when they have structural problems, instead of silently installing
@@ -306,7 +312,13 @@ in `.statecat/config` (see Configuration).
 `statecat.py config` prints the effective settings;
 `statecat.py config set stale_days 30` changes one key. Unknown
 keys are ignored and bad values fall back to their defaults, so a
-hand-edited config can never break the CLI. The config file is
+hand-edited config can never break the CLI. `config set` rejects
+out-of-range values with an error naming the valid range
+(stale_days 0-1000000, size_lines 1-1000000, size_bytes
+1-1000000000, backups_kept 0-1000, lock_timeout 0.1-3600,
+lock_stale 1-86400). A config file that is not valid JSON warns
+on stderr and falls back to defaults instead of silently
+ignoring the breakage. The config file is
 local only: it lives under `.statecat/`, which `init` gitignores.
 
 ## One writer at a time, enforced
@@ -318,6 +330,10 @@ won. Writes now run under a cross-platform lock directory
 the last write. A second writer waits up to 10 seconds, then
 fails cleanly with "the lock is held" and changes nothing. A lock
 left behind by a crashed process is broken after 60 seconds.
+The lock carries a random owner token, and release only deletes
+the lock when that token still matches, so a writer whose lock
+was broken as stale while it was paused cannot delete a new
+owner's lock on its way out.
 Read-only commands (`show`, `check` without `--fix`, `search`,
 `status`, `diff`) do not take the lock.
 

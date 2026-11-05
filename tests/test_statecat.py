@@ -989,6 +989,185 @@ class StateCatTest(unittest.TestCase):
 
 
 
+    # --- P0 fix round 2026-11-04 ---
+    def test_lock_owner_token_stale_writer_cannot_delete_new_owners_lock(self):
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            self.assertIsNotNone(first.owner_token)
+            # Age the lock so a second writer treats it as stale.
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            second = statecat.project_lock(self.dir)
+            second.__enter__()
+            self.assertNotEqual(second.owner_token, first.owner_token)
+            self.assertTrue(os.path.isdir(lock_path))
+            # The stale first writer releasing must not delete the
+            # new owner's lock.
+            first.__exit__(None, None, None)
+            self.assertTrue(os.path.isdir(lock_path))
+            self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
+            # The current owner releasing normally does delete it.
+            second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_config_set_rejects_out_of_range_values(self):
+        self.init_project()
+        cases = (
+            ("stale_days", "-5", "0 and 1000000"),
+            ("backups_kept", "-1", "0 and 1000"),
+            ("lock_timeout", "0", "0.1 and 3600"),
+            ("lock_stale", "-1", "1 and 86400"),
+            ("size_lines", "0", "1 and 1000000"),
+            ("size_bytes", "0", "1 and 1000000000"),
+        )
+        for key, value, expected_range in cases:
+            result = run_cli(self.dir, "config", "set", key, value)
+            self.assertNotEqual(result.returncode, 0, (key, value))
+            self.assertIn("must be between %s" % expected_range, result.stderr, (key, value))
+        config = json.loads(run_cli(self.dir, "config").stdout)
+        self.assertEqual(config["stale_days"], 14)
+        self.assertEqual(config["backups_kept"], 20)
+        self.assertEqual(config["lock_timeout"], 10.0)
+        self.assertEqual(config["lock_stale"], 60.0)
+
+    def test_malformed_config_warns_and_uses_defaults(self):
+        self.init_project()
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not valid JSON", result.stderr)
+        self.assertIn("using defaults", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stale_days"], 14)
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write('{"stale_days": -5}')
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("out-of-range", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stale_days"], 14)
+
+    def test_invalid_utf8_fails_cleanly_not_traceback(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Keep me")
+        with open(state_path(self.dir), "ab") as handle:
+            handle.write(b"\xff\xfe bad bytes\n")
+        for args in (("show",), ("check",), ("status",)):
+            result = run_cli(self.dir, *args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertNotIn("Traceback", result.stderr, args)
+            self.assertIn("not valid UTF-8", result.stderr, args)
+        # Restore is the recovery for a bad current file: it works.
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(b"bad bytes", read_bytes(state_path(self.dir)))
+        # But a snapshot that itself is invalid UTF-8 is refused
+        # cleanly, before anything is overwritten.
+        other = tempfile.TemporaryDirectory()
+        try:
+            run_cli(other.name, "init", "Other")
+            run_cli(other.name, "add", "Open", "Good item")
+            broken = os.path.join(other.name, ".statecat", "backups", "20260101T000000000000")
+            os.makedirs(broken)
+            with open(os.path.join(broken, "STATE.md"), "wb") as handle:
+                handle.write(b"\xff\xfe broken\n")
+            shutil.copy(archive_path(other.name), os.path.join(broken, "STATE-ARCHIVE.md"))
+            before = read_bytes(state_path(other.name))
+            result = run_cli(other.name, "restore", "20260101T000000000000")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("not valid UTF-8", result.stderr)
+            self.assertEqual(read_bytes(state_path(other.name)), before)
+        finally:
+            other.cleanup()
+
+    def test_check_fix_restores_missing_last_id(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "One")
+        run_cli(self.dir, "add", "Open", "Two")
+        text = read_text(state_path(self.dir))
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("> Last ID used:")) + "\n"
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fixed Last ID used to #2", result.stdout)
+        self.assertNotIn("nothing to fix", result.stdout)
+        self.assertIn("Last ID used: #2", read_text(state_path(self.dir)))
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("clean", result.stdout)
+
+    def test_restore_refuses_partial_snapshot(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Good item")
+        snap = os.path.join(self.dir, ".statecat", "backups", "20260101T000000000000")
+        os.makedirs(snap)
+        shutil.copy(archive_path(self.dir), os.path.join(snap, "STATE-ARCHIVE.md"))
+        before_state = read_bytes(state_path(self.dir))
+        before_archive = read_bytes(archive_path(self.dir))
+        before_list = run_cli(self.dir, "restore", "--list").stdout
+        result = run_cli(self.dir, "restore", "20260101T000000000000")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete", result.stderr)
+        self.assertIn("STATE.md", result.stderr)
+        self.assertNotIn("restored", result.stdout)
+        # Neither file was touched, and no safety snapshot was taken.
+        self.assertEqual(read_bytes(state_path(self.dir)), before_state)
+        self.assertEqual(read_bytes(archive_path(self.dir)), before_archive)
+        self.assertEqual(run_cli(self.dir, "restore", "--list").stdout, before_list)
+
+    def test_add_rejects_empty_text(self):
+        self.init_project()
+        for text in ("", "   "):
+            result = run_cli(self.dir, "add", "Decided", text)
+            self.assertNotEqual(result.returncode, 0, repr(text))
+            self.assertIn("must not be empty", result.stderr, repr(text))
+        self.assertNotIn("- #1", read_text(state_path(self.dir)))
+        self.assertIn("no snapshots", run_cli(self.dir, "restore", "--list").stdout)
+
+    def test_clearer_errors_list_buckets_suggest_show_and_list_snapshots(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "One")
+        for args in (("add", "Nope", "x"), ("show", "Nope")):
+            result = run_cli(self.dir, *args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn(
+                "valid buckets: Decided, Open, Waiting on human, Waiting on others, Parked",
+                result.stderr,
+                args,
+            )
+        result = run_cli(self.dir, "move", "99", "Open")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no item #99", result.stderr)
+        self.assertIn("python3 statecat.py show", result.stderr)
+        result = run_cli(self.dir, "restore", "no-such-snapshot")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no snapshot 'no-such-snapshot'", result.stderr)
+        self.assertIn("available snapshots:", result.stderr)
+        result = run_cli(self.dir, "search", "zzz-no-match")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no matches", result.stdout)
+        help_text = run_cli(self.dir, "search", "--help").stdout
+        self.assertIn("Exits 1", help_text)
+        self.assertIn("exits with code 1", read_text(os.path.join(ROOT, "README.md")))
+
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(StateCatTest)

@@ -89,7 +89,9 @@ existing project, and `pointer` just prints it.
   diff between a snapshot and the current files. `.statecat/config`
   (JSON) tunes stale days, size budget, backup count, and lock
   timing; `config` prints the effective settings, `config set`
-  changes one key.
+  changes one key and rejects out-of-range values with an error
+  naming the valid range. A config file that is not valid JSON
+  warns and falls back to defaults.
 
 ## Parked: soft protection, admitted
 
@@ -154,7 +156,9 @@ is calling it, and a hand edit bypasses it entirely.
   cross-platform lock directory (`.statecat/lock`). A second
   writer waits up to 10 seconds, then fails cleanly and changes
   nothing. A lock left behind by a crashed process is broken
-  after 60 seconds. Read-only commands do not take the lock.
+  after 60 seconds. The lock carries a random owner token, and
+  release only deletes the lock when that token still matches.
+  Read-only commands do not take the lock.
 
 ## Manual rules: no CLI available
 

@@ -76,6 +76,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from datetime import date
 
 VERSION = "1.1.1"
@@ -91,6 +92,15 @@ BUCKETS = [
     "Waiting on others",
     "Parked",
 ]
+VALID_BUCKETS_TEXT = ", ".join(BUCKETS)
+
+
+def unknown_bucket_message(bucket):
+    """Clean error for an unknown bucket, listing the valid ones."""
+    return "error: unknown bucket %r; valid buckets: %s\n" % (
+        bucket,
+        VALID_BUCKETS_TEXT,
+    )
 # Lowercase / short spellings accepted on the command line.
 BUCKET_ALIASES = {
     "decided": "Decided",
@@ -213,8 +223,18 @@ class StateFile:
         self.unknown_headings = []  # list of (line_index, heading)
         self.orphan_lines = []  # list of (line_index, content)
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8", newline="") as handle:
-                raw = handle.readlines()
+            try:
+                with open(path, "r", encoding="utf-8", newline="") as handle:
+                    raw = handle.readlines()
+            except UnicodeDecodeError:
+                # A file with invalid UTF-8 must fail cleanly, never
+                # with a raw traceback, including for restore: the
+                # caller decides the recovery, the user gets a
+                # readable error.
+                fail_cleanly(
+                    "'%s' is not valid UTF-8; fix or remove the bad "
+                    "bytes, or run statecat restore" % os.path.basename(path)
+                )
             for content, ending in (split_ending(line) for line in raw):
                 self.lines.append([content, ending])
         self._parse()
@@ -297,10 +317,15 @@ class StateFile:
                     break
             ending = self.lines[0][1] if self.lines else "\n"
             self.lines.insert(insert_at, ["> Last ID used: #%d" % value, ending])
-            # Line indices of later items shift by one.
+            # Line indices of later items shift by one, including
+            # their continuation lines, which are absolute indices.
             for item in self.items:
                 if item.line_index >= insert_at:
                     item.line_index += 1
+                item.continuation_indices = [
+                    index + 1 if index >= insert_at else index
+                    for index in item.continuation_indices
+                ]
             self.last_id_index = insert_at
         self.last_id = value
 
@@ -558,18 +583,40 @@ class project_lock:
     write, so two writers can no longer both read the same Last ID
     used, assign the same next ID, and silently lose one item.
     Read-only commands do not take the lock.
+
+    Ownership: acquiring the lock writes a random owner token
+    (PID + uuid) into the lock's owner file. Release only deletes
+    the lock directory when the token on disk still matches the
+    token this writer wrote. A writer whose lock was broken as
+    stale while it was paused can therefore never delete a new
+    owner's lock on its way out.
     """
 
     def __init__(self, directory):
         self.directory = directory
         self.lock_path = os.path.join(directory, ".statecat", LOCK_DIRNAME)
         self.acquired = False
+        self.owner_token = None
+        self.token_written = False
 
     def _lock_age(self):
         try:
             return time.time() - os.path.getmtime(self.lock_path)
         except OSError:
             return 0.0
+
+    def _read_owner_token(self):
+        try:
+            with open(os.path.join(self.lock_path, "owner"), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("token="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return None
+
+    def _owns_lock(self):
+        return self.owner_token is not None and self._read_owner_token() == self.owner_token
 
     def __enter__(self):
         # Timeout and staleness: STATECAT_LOCK_TIMEOUT / STATECAT_LOCK_STALE
@@ -606,8 +653,11 @@ class project_lock:
                 continue
             break
         try:
+            self.owner_token = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
             with open(os.path.join(self.lock_path, "owner"), "w", encoding="utf-8") as handle:
                 handle.write("pid=%d time=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
+                handle.write("token=%s\n" % self.owner_token)
+            self.token_written = True
         except OSError:
             pass
         self.acquired = True
@@ -615,7 +665,13 @@ class project_lock:
 
     def __exit__(self, exc_type, exc, tb):
         if self.acquired:
-            shutil.rmtree(self.lock_path, ignore_errors=True)
+            # Only delete the lock when it is still ours. If a new
+            # owner broke our stale lock and took over, the token on
+            # disk no longer matches, and the directory stays put.
+            # If the token cannot be read at all, fail safe and
+            # leave the directory: the stale-break will clear it.
+            if self._owns_lock():
+                shutil.rmtree(self.lock_path, ignore_errors=True)
             self.acquired = False
         return False
 
@@ -637,6 +693,35 @@ DEFAULT_CONFIG = {
     "lock_timeout": LOCK_TIMEOUT_SECONDS,
     "lock_stale": LOCK_STALE_SECONDS,
 }
+# Valid ranges for `config set` (inclusive). Values outside these
+# are rejected, never silently stored. stale_days 0 is allowed:
+# it just flags every unstarred waiting item as stale.
+CONFIG_RANGES = {
+    "stale_days": (0, 1000000),
+    "size_lines": (1, 1000000),
+    "size_bytes": (1, 1000000000),
+    "backups_kept": (0, 1000),
+    "lock_timeout": (0.1, 3600),
+    "lock_stale": (1, 86400),
+}
+
+
+def config_range_error(key, value):
+    """Return an error string when value is outside its range, else None."""
+    low, high = CONFIG_RANGES[key]
+    if value < low or value > high:
+        return "error: %s must be between %s and %s (got %s)\n" % (
+            key,
+            low,
+            high,
+            value,
+        )
+    return None
+
+
+# A malformed .statecat/config is warned about once per process, so a
+# command that loads the config several times does not spam stderr.
+_config_warnings_printed = False
 
 
 def config_path(directory):
@@ -647,22 +732,53 @@ def load_config(directory):
     """Effective config: defaults, overlaid with .statecat/config (JSON).
 
     Unknown keys are ignored; values that do not coerce to the right
-    type fall back to their default. A missing or broken file means
-    plain defaults."""
+    type, or are outside their valid range, fall back to their
+    default. A missing file means plain defaults. A malformed JSON
+    file warns on stderr (once per process) and falls back to
+    defaults, instead of silently ignoring the breakage."""
+    global _config_warnings_printed
     config = dict(DEFAULT_CONFIG)
+    warnings = []
     try:
         with open(config_path(directory), "r", encoding="utf-8") as handle:
             raw = json.load(handle)
-    except (OSError, ValueError):
+    except OSError:
         return config
-    if not isinstance(raw, dict):
-        return config
-    for key, caster in CONFIG_KEYS.items():
-        if key in raw:
-            try:
-                config[key] = caster(raw[key])
-            except (TypeError, ValueError):
-                continue
+    except ValueError:
+        warnings.append(
+            "warning: .statecat/config is not valid JSON; using defaults"
+        )
+        raw = None
+    if raw is not None:
+        if not isinstance(raw, dict):
+            warnings.append(
+                "warning: .statecat/config is not a JSON object; using defaults"
+            )
+        else:
+            for key, caster in CONFIG_KEYS.items():
+                if key in raw:
+                    try:
+                        value = caster(raw[key])
+                    except (TypeError, ValueError):
+                        warnings.append(
+                            "warning: ignoring invalid value for %s in "
+                            ".statecat/config; using default %s"
+                            % (key, config[key])
+                        )
+                        continue
+                    range_error = config_range_error(key, value)
+                    if range_error is not None:
+                        warnings.append(
+                            "warning: ignoring out-of-range value for %s "
+                            "in .statecat/config (%s); using default %s"
+                            % (key, value, config[key])
+                        )
+                        continue
+                    config[key] = value
+    if warnings and not _config_warnings_printed:
+        for warning in warnings:
+            sys.stderr.write(warning + "\n")
+        _config_warnings_printed = True
     return config
 
 
@@ -685,6 +801,10 @@ def cmd_config(args):
             value = CONFIG_KEYS[key](args.value)
         except (TypeError, ValueError):
             sys.stderr.write("error: %r is not a valid value for %s\n" % (args.value, key))
+            return 1
+        range_error = config_range_error(key, value)
+        if range_error is not None:
+            sys.stderr.write(range_error)
             return 1
         config = load_config(directory)
         config[key] = value
@@ -998,7 +1118,7 @@ def cmd_show(args):
         if args.bucket:
             bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
             if bucket is None:
-                sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
+                sys.stderr.write(unknown_bucket_message(args.bucket))
                 return 1
             buckets = [bucket]
         data = {
@@ -1014,7 +1134,7 @@ def cmd_show(args):
     if args.bucket:
         bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
         if bucket is None:
-            sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
+            sys.stderr.write(unknown_bucket_message(args.bucket))
             return 1
         start, end = state.bucket_range(bucket)
         if start is None:
@@ -1130,7 +1250,10 @@ def cmd_add(args):
     validate_or_fail(state, archive)
     bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
     if bucket is None:
-        sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
+        sys.stderr.write(unknown_bucket_message(args.bucket))
+        return 1
+    if args.text is None or not args.text.strip():
+        sys.stderr.write("error: item text must not be empty\n")
         return 1
     reject_newlines(args.text, "item text")
     if args.because:
@@ -1151,7 +1274,10 @@ def cmd_add(args):
 def find_item_or_fail(state, item_id):
     item = state.find(item_id)
     if item is None:
-        sys.stderr.write("error: no item #%d in %s\n" % (item_id, STATE))
+        sys.stderr.write(
+            "error: no item #%d in %s; run 'python3 statecat.py show' "
+            "to list items\n" % (item_id, STATE)
+        )
         sys.exit(1)
     return item
 
@@ -1191,7 +1317,7 @@ def cmd_move_real(args):
     item = find_item_or_fail(state, item_id)
     bucket = BUCKET_ALIASES.get(args.bucket.strip().lower())
     if bucket is None:
-        sys.stderr.write("error: unknown bucket %r\n" % args.bucket)
+        sys.stderr.write(unknown_bucket_message(args.bucket))
         return 1
     if item.bucket == "Parked" and not args.owner_approved:
         sys.stderr.write("error: #%d is Parked; moving out of Parked requires --owner-approved.\n" % item_id)
@@ -1406,7 +1532,13 @@ def cmd_check(args):
                 if item_id > highest:
                     highest = item_id
         counter_fixed = False
-        if state.last_id is not None and highest > state.last_id:
+        if state.last_id is None:
+            # The Last ID used line itself is missing: restore it
+            # from the highest ID in use (or #0 when there are none),
+            # instead of reporting "nothing to fix".
+            state.set_last_id(highest)
+            counter_fixed = True
+        elif highest > state.last_id:
             state.set_last_id(highest)
             counter_fixed = True
         if fixed or counter_fixed:
@@ -1442,6 +1574,66 @@ def find_snapshot(snapshots, name):
     return match
 
 
+def snapshot_is_complete(target_path, target_name):
+    """Validate a snapshot BEFORE anything is overwritten.
+
+    Both files must be present and parse as UTF-8. A snapshot that
+    fails here is refused with a clean error and nothing is
+    restored, instead of silently skipping the missing file while
+    printing success. Structural problems in a snapshot do not
+    fail validation: restoring a broken snapshot still warns after
+    the restore, as before.
+    """
+    for filename in (STATE, ARCHIVE):
+        path = os.path.join(target_path, filename)
+        if not os.path.exists(path):
+            sys.stderr.write(
+                "error: snapshot %r is incomplete: %s is missing; "
+                "nothing was restored.\n" % (target_name, filename)
+            )
+            return False
+    # Parsing both files also rejects invalid UTF-8, via StateFile,
+    # before any file is touched.
+    StateFile(os.path.join(target_path, STATE))
+    StateFile(os.path.join(target_path, ARCHIVE))
+    return True
+
+
+def atomic_write_pair(directory, data_by_filename):
+    """Write both state files as a pair: stage both temp files
+    first (0644, like atomic_write_bytes), then rename both
+    back-to-back. That cannot make two renames truly atomic, but
+    no file I/O happens between them, so the window in which a
+    crash could leave a mixed pair is just the two renames."""
+    staged = []
+    try:
+        for filename, data in data_by_filename:
+            target = os.path.join(directory, filename)
+            tmp_dir = os.path.dirname(target) or "."
+            handle, tmp_path = tempfile.mkstemp(dir=tmp_dir, prefix=".statecat-tmp-")
+            with os.fdopen(handle, "wb") as out:
+                out.write(data)
+            os.chmod(tmp_path, 0o644)
+            staged.append((tmp_path, target))
+        for tmp_path, target in staged:
+            os.replace(tmp_path, target)
+    except BaseException:
+        for tmp_path, _target in staged:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def _available_snapshots_text(snapshots):
+    if not snapshots:
+        return "no snapshots are available"
+    return "available snapshots: %s" % ", ".join(
+        name for name, _kind, _path in snapshots
+    )
+
+
 def cmd_restore(args):
     directory = find_restore_root()
     if directory is None:
@@ -1469,6 +1661,7 @@ def cmd_restore(args):
             return 1
         if match is None:
             sys.stderr.write("error: no snapshot %r\n" % args.snapshot)
+            sys.stderr.write("%s\n" % _available_snapshots_text(snapshots))
             return 1
         target_name, _kind, target_path = match
     else:
@@ -1477,15 +1670,15 @@ def cmd_restore(args):
             sys.stderr.write("error: no pre-write snapshot to restore\n")
             return 1
         target_name, _kind, target_path = pre_write[-1]
+    if not snapshot_is_complete(target_path, target_name):
+        return 1
     # Safety snapshot first; it is never the default target.
     take_snapshot(directory, "safety")
+    data_by_filename = []
     for filename in (STATE, ARCHIVE):
-        source = os.path.join(target_path, filename)
-        target = os.path.join(directory, filename)
-        if os.path.exists(source):
-            with open(source, "rb") as handle:
-                data = handle.read()
-            atomic_write_bytes(target, data)
+        with open(os.path.join(target_path, filename), "rb") as handle:
+            data_by_filename.append((filename, handle.read()))
+    atomic_write_pair(directory, data_by_filename)
     print("restored %s" % target_name)
     # Verify what was restored: a snapshot can itself carry structural
     # problems, and installing it silently would trade one broken
@@ -1510,6 +1703,7 @@ def cmd_diff(args):
             return 1
         if match is None:
             sys.stderr.write("error: no snapshot %r\n" % args.snapshot)
+            sys.stderr.write("%s\n" % _available_snapshots_text(snapshots))
             return 1
         target_name, _kind, target_path = match
     else:
@@ -1524,8 +1718,13 @@ def cmd_diff(args):
         snapshot_file = os.path.join(target_path, filename)
         if not os.path.exists(snapshot_file):
             continue
-        with open(snapshot_file, "r", encoding="utf-8", newline="") as handle:
-            old = handle.readlines()
+        try:
+            with open(snapshot_file, "r", encoding="utf-8", newline="") as handle:
+                old = handle.readlines()
+        except UnicodeDecodeError:
+            fail_cleanly(
+                "snapshot %s file %s is not valid UTF-8" % (target_name, filename)
+            )
         new = [content + ending for content, ending in current]
         diff = list(difflib.unified_diff(
             old, new,
@@ -1570,7 +1769,8 @@ def build_parser():
     p = sub.add_parser("status", help="Print a compact summary: counts, stale items, size, check result")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("search", help="Search item text (case-insensitive substring)")
+    p = sub.add_parser("search", help="Search item text (case-insensitive substring); exits 1 when nothing matches",
+                         description="Search item text (case-insensitive substring). Exits 1 when nothing matches.")
     p.add_argument("text", help="Text to find")
     p.add_argument("--archive", action="store_true", help="Also search STATE-ARCHIVE.md")
     p.set_defaults(func=cmd_search)
