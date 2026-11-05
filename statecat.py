@@ -70,11 +70,13 @@ Rules implemented here (StateCat scope, revision 5):
 import argparse
 import difflib
 import json
+import math
 import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import date
@@ -575,6 +577,42 @@ def backup_root(directory):
     return os.path.join(directory, BACKUP_ROOT)
 
 
+def _pid_is_alive(pid):
+    """True if pid exists, False if definitely dead, None if unknown.
+
+    os.kill(pid, 0) does not send a signal; it only checks
+    existence. ProcessLookupError means dead, PermissionError
+    means a process exists that we may not signal, and any
+    other OSError (including platforms where signal 0 is not
+    meaningful) means liveness cannot be established here.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, OverflowError):
+        return None
+    return True
+
+
+# A lock whose owner cannot be determined -- no owner file yet,
+# an unreadable owner file, or a liveness check that returns
+# indeterminate -- is never abandoned in the normal stale
+# window: unknown is not dead. It is only abandoned after this
+# many multiples of the stale limit, a second threshold long
+# enough that a writer merely paused between creating the lock
+# directory and writing its owner file (milliseconds in normal
+# operation) has either finished writing or is dead.
+UNKNOWN_OWNER_STALE_MULTIPLIER = 10
+
+
+# Env-override timing warnings are printed once per process, so a
+# command that acquires the lock several times does not spam stderr.
+_lock_timing_warning_printed = False
+
+
 class project_lock:
     """Cross-platform write lock for one project, via atomic mkdir.
 
@@ -585,11 +623,73 @@ class project_lock:
     Read-only commands do not take the lock.
 
     Ownership: acquiring the lock writes a random owner token
-    (PID + uuid) into the lock's owner file. Release only deletes
-    the lock directory when the token on disk still matches the
-    token this writer wrote. A writer whose lock was broken as
-    stale while it was paused can therefore never delete a new
-    owner's lock on its way out.
+    (PID + uuid) into the lock's owner file. Release and stale
+    removal never check-then-delete in place: they first rename
+    the lock directory aside (atomic on one filesystem), then
+    verify the token or the age on the renamed copy, and only
+    delete it when the copy is still theirs / still stale. A
+    copy that turns out to belong to someone else, or to be
+    fresh, is put back if the lock path is free, and never
+    deleted. That closes the check-then-delete race where a
+    writer could read its own token, pause while another writer
+    took over, and then delete the new owner's lock.
+
+    Abandonment is proved, not assumed from age alone, and
+    unknown is not dead. A lock whose owner PID is still alive
+    is never deleted as stale, however old its directory looks,
+    and while a lock is held a daemon heartbeat thread touches
+    its directory mtime every few seconds, so a long-running
+    but alive writer's lock stays fresh. A stale lock is
+    therefore only broken when its directory is old *and* its
+    owner is proved dead. A lock whose owner cannot be
+    determined -- no owner file yet, an unreadable owner file,
+    or a liveness check that returns indeterminate -- is not
+    deleted in the normal stale window at all; it is only
+    abandoned after ten times the stale limit, a second
+    threshold long enough that a writer merely paused between
+    creating the lock directory and writing its owner file
+    (milliseconds in normal operation) has either finished
+    writing or is dead. The owner file itself is created
+    exclusively, so a writer whose directory was broken and
+    replaced can never write its token into the new owner's
+    lock: the exclusive create fails and it waits and retries
+    instead. A writer that fails to write its owner file for
+    any other reason deletes nothing: the directory at the
+    lock path may already be a replacement writer's lock, and
+    no check can prove it is still ours, so it is left for
+    stale cleanup and the writer fails cleanly. A genuinely
+    own directory left behind strands the project until it
+    ages past the unknown-owner second threshold, because it
+    has no owner file to prove its owner dead.
+
+    Residual limitation, stated honestly: the rename is atomic,
+    but the verify-and-delete/restore that follows is not one
+    operation. If a third writer creates a lock directory in
+    the tiny window between the existence check in
+    _restore_trash and the rename, the restore is declined
+    (the trash dir is left for later stale cleanup) rather
+    than overwriting it, but that check and the rename are
+    still two steps, so a mkdir landing exactly between them
+    could still be replaced on POSIX. A crash in that same
+    window leaves the same kind of leftover, never a deleted
+    live lock. A PID recorded in the owner file can be reused
+    by an unrelated process after the owner dies, and that
+    strands the lock: the liveness check reports the reused
+    PID as alive, so the lock is treated as belonging to a
+    live writer until that unrelated process exits, however
+    stale the directory looks. The heartbeat does not fix
+    this -- the original owner's heartbeat thread died with
+    it, and the unrelated process never touches the lock's
+    mtime. This is a conservative failure (a stranded lock,
+    never a deleted live one), but it is not harmless: a lock
+    in this state blocks writers until the PID is freed, and
+    there is no start-time check to tell the reused PID from
+    the original owner. The second threshold for unknown
+    ownership is likewise not a proof: a writer suspended
+    for longer than ten times the stale limit between mkdir
+    and its owner write could still lose its lock, and the
+    exclusive owner-file create is what keeps that case
+    from corrupting the replacement owner's lock.
     """
 
     def __init__(self, directory):
@@ -598,6 +698,94 @@ class project_lock:
         self.acquired = False
         self.owner_token = None
         self.token_written = False
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+        self._heartbeat_interval = 10.0
+
+    def _read_owner_pid_from(self, directory):
+        """Owner PID from a lock dir's owner file, or None."""
+        try:
+            with open(os.path.join(directory, "owner"), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("pid="):
+                        # The line is "pid=<n> time=<stamp>".
+                        return int(line.split("=", 1)[1].strip().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
+    def _is_abandoned_dir(self, directory, stale):
+        """True only when abandonment is proved, never on unknown ownership.
+
+        Unknown is not dead. A lock whose owner PID cannot be
+        determined, or whose liveness cannot be established,
+        is never deleted in the normal stale window: it may
+        belong to a writer paused between mkdir and writing
+        its owner file, and deleting it would let that writer
+        resume into a new owner's lock. Such a lock is only
+        abandoned after a much longer second threshold
+        (UNKNOWN_OWNER_STALE_MULTIPLIER times the stale
+        limit), by which time a writer merely paused between
+        mkdir and its owner write -- a gap of milliseconds
+        in normal operation -- has either finished writing
+        or is dead. A lock with a recorded, definitely dead
+        owner is abandoned at the normal stale limit; a live
+        owner is never abandoned, however old the lock looks.
+        """
+        if not self._is_stale_dir(directory, stale):
+            return False
+        pid = self._read_owner_pid_from(directory)
+        if pid is None:
+            return self._is_stale_dir(
+                directory, stale * UNKNOWN_OWNER_STALE_MULTIPLIER
+            )
+        alive = _pid_is_alive(pid)
+        if alive is True:
+            return False
+        if alive is None:
+            return self._is_stale_dir(
+                directory, stale * UNKNOWN_OWNER_STALE_MULTIPLIER
+            )
+        return True
+
+    def _heartbeat_loop(self):
+        """Touch the lock dir mtime while this lock is held.
+
+        Runs in a daemon thread, stopped in __exit__. It only
+        touches the directory while the token on disk still
+        matches ours. The token check and the touch are two
+        separate steps, so a takeover landing between them
+        could make it touch a successor's directory once; it
+        never deletes or replaces anything, it only refreshes
+        an mtime, and the thread stops on the first such
+        mismatch or error.
+        """
+        while not self._heartbeat_stop.wait(self._heartbeat_interval):
+            if not self.acquired:
+                return
+            try:
+                if self._read_owner_token() != self.owner_token:
+                    return
+                os.utime(self.lock_path, None)
+            except OSError:
+                return
+
+    def _start_heartbeat(self, stale):
+        """Start the heartbeat thread; interval scales with stale."""
+        self._heartbeat_interval = min(10.0, max(1.0, stale / 6.0))
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        """Stop the heartbeat thread, if one is running."""
+        if self._heartbeat_thread is not None:
+            self._heartbeat_stop.set()
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+            self._heartbeat_stop = None
 
     def _lock_age(self):
         try:
@@ -605,9 +793,9 @@ class project_lock:
         except OSError:
             return 0.0
 
-    def _read_owner_token(self):
+    def _read_owner_token_from(self, directory):
         try:
-            with open(os.path.join(self.lock_path, "owner"), "r", encoding="utf-8") as handle:
+            with open(os.path.join(directory, "owner"), "r", encoding="utf-8") as handle:
                 for line in handle:
                     if line.startswith("token="):
                         return line.split("=", 1)[1].strip()
@@ -615,30 +803,168 @@ class project_lock:
             pass
         return None
 
+    def _read_owner_token(self):
+        return self._read_owner_token_from(self.lock_path)
+
     def _owns_lock(self):
         return self.owner_token is not None and self._read_owner_token() == self.owner_token
+
+    def _trash_path(self):
+        """Unique sibling path for a lock dir moved out of the way."""
+        return "%s.gone-%d-%s" % (self.lock_path, os.getpid(), uuid.uuid4().hex)
+
+    def _rename_lock_to_trash(self):
+        """Atomically move the lock dir aside; return its new path or None.
+
+        os.rename is atomic on one filesystem, so the dir is either
+        still at lock_path or wholly at the trash path, never half
+        moved. Returns None when the lock dir is already gone.
+        """
+        trash = self._trash_path()
+        try:
+            os.rename(self.lock_path, trash)
+        except OSError:
+            return None
+        return trash
+
+    def _restore_trash(self, trash):
+        """Move a renamed lock dir back, only if lock_path is free.
+
+        Never renames over an existing lock_path: on POSIX
+        os.rename can replace an existing *empty* directory,
+        so an unchecked rename could destroy a third writer's
+        just-created lock. If lock_path already exists, the
+        trash dir is left in place for later stale cleanup.
+        Residual race, stated honestly: a mkdir can land in
+        the tiny window between the lexists check and the
+        rename; that window is a single call sequence, and
+        the worst case is the same empty-dir replacement,
+        which is why a declined restore is never an error.
+        """
+        if os.path.lexists(self.lock_path):
+            return False
+        try:
+            os.rename(trash, self.lock_path)
+        except OSError:
+            return False
+        return True
+
+    def _delete_trash(self, trash):
+        shutil.rmtree(trash, ignore_errors=True)
+
+    def _is_stale_dir(self, directory, stale):
+        """True when a lock dir's mtime is older than the stale limit."""
+        try:
+            return time.time() - os.path.getmtime(directory) > stale
+        except OSError:
+            return False
+
+    def _cleanup_orphaned_lock_dirs(self, stale):
+        """Remove lock dirs a crashed release left renamed aside.
+
+        Only dirs _is_abandoned_dir judges abandoned are
+        removed: a live writer's rename-then-verify window is
+        milliseconds, so its trash dir is always fresh and
+        never touched here, and a trash dir whose owner is
+        unknown is held to the longer second threshold, for
+        the same reason as a live lock (see _is_abandoned_dir).
+        """
+        parent = os.path.dirname(self.lock_path)
+        prefix = LOCK_DIRNAME + ".gone-"
+        try:
+            names = os.listdir(parent)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            path = os.path.join(parent, name)
+            if os.path.isdir(path) and self._is_abandoned_dir(path, stale):
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _resolve_lock_timing(self, config):
+        """(timeout, stale) with env overrides fully range-checked.
+
+        STATECAT_LOCK_TIMEOUT / STATECAT_LOCK_STALE override
+        .statecat/config, which overrides the defaults, but an
+        env value gets the same config_range_error bounds as
+        `config set` and JSON (lock_timeout 0.1-3600,
+        lock_stale 1-86400, finite only). An unparseable,
+        non-finite, or out-of-range env value warns once per
+        process and falls back to the config value, so a bad
+        env var can never make a writer wait forever or break
+        a live lock after a fraction of a second.
+
+        The stale > timeout rule is warning-only here: env
+        overrides are an operator/test escape hatch, and the
+        test suite deliberately uses timeout 5 / stale 1 to
+        make stale break quickly. A stale value that is not
+        greater than the timeout warns, and the values are
+        kept. The strict rule (reject) applies to `config
+        set` and to JSON config, in cmd_config / load_config.
+        """
+        global _lock_timing_warning_printed
+        values = {}
+        warned = False
+        for env_key, key in (
+            ("STATECAT_LOCK_TIMEOUT", "lock_timeout"),
+            ("STATECAT_LOCK_STALE", "lock_stale"),
+        ):
+            raw = os.environ.get(env_key)
+            if raw is None:
+                values[key] = config[key]
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                if not _lock_timing_warning_printed:
+                    sys.stderr.write(
+                        "warning: ignoring invalid %s %r; using %s\n"
+                        % (env_key, raw, config[key])
+                    )
+                    warned = True
+                values[key] = config[key]
+                continue
+            range_error = config_range_error(key, value)
+            if range_error is not None:
+                if not _lock_timing_warning_printed:
+                    sys.stderr.write(
+                        "warning: ignoring out-of-range %s %r (%s); using %s\n"
+                        % (env_key, raw, range_error.strip(), config[key])
+                    )
+                    warned = True
+                values[key] = config[key]
+                continue
+            values[key] = value
+        timeout = values["lock_timeout"]
+        stale = values["lock_stale"]
+        if stale <= timeout and not _lock_timing_warning_printed:
+            sys.stderr.write(
+                "warning: lock_stale (%s) is not greater than "
+                "lock_timeout (%s); a waiter can have its lock "
+                "broken as stale\n" % (stale, timeout)
+            )
+            warned = True
+        if warned:
+            _lock_timing_warning_printed = True
+        return timeout, stale
 
     def __enter__(self):
         # Timeout and staleness: STATECAT_LOCK_TIMEOUT / STATECAT_LOCK_STALE
         # (for tests) override .statecat/config, which overrides defaults.
         config = load_config(self.directory)
-        try:
-            timeout = float(os.environ.get("STATECAT_LOCK_TIMEOUT", config["lock_timeout"]))
-        except ValueError:
-            timeout = config["lock_timeout"]
-        try:
-            stale = float(os.environ.get("STATECAT_LOCK_STALE", config["lock_stale"]))
-        except ValueError:
-            stale = config["lock_stale"]
+        timeout, stale = self._resolve_lock_timing(config)
         os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        self._cleanup_orphaned_lock_dirs(stale)
         deadline = time.monotonic() + timeout
         while True:
             try:
                 os.mkdir(self.lock_path)
             except FileExistsError:
-                if self._lock_age() > stale:
-                    shutil.rmtree(self.lock_path, ignore_errors=True)
-                    continue
+                # Check the deadline first: a lock that is
+                # restored (live owner, or fresh) must not spin
+                # the rename/restore loop forever. A stale
+                # break is only attempted while time remains.
                 if time.monotonic() >= deadline:
                     sys.stderr.write(
                         "error: another statecat process is writing in this project; "
@@ -646,32 +972,118 @@ class project_lock:
                     )
                     sys.stderr.write("No files were changed.\n")
                     sys.exit(1)
+                if self._lock_age() > stale:
+                    trash = self._rename_lock_to_trash()
+                    if trash is None:
+                        continue
+                    # Re-check on the renamed dir: a fresh lock
+                    # may have been created between the age check
+                    # and the rename, and a lock whose owner is
+                    # still alive is never abandoned, however old
+                    # it looks. Only a still-stale dir with a
+                    # proved-dead owner -- or an unknown owner
+                    # past the longer second threshold -- is
+                    # deleted; any other copy is put back,
+                    # never deleted.
+                    if self._is_abandoned_dir(trash, stale):
+                        self._delete_trash(trash)
+                    else:
+                        self._restore_trash(trash)
+                        time.sleep(LOCK_POLL_SECONDS)
+                    continue
                 time.sleep(LOCK_POLL_SECONDS)
                 continue
             except FileNotFoundError:
                 os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
                 continue
-            break
+            # mkdir succeeded: write the owner file exclusively.
+            # If we lost the race in the window between mkdir
+            # and the write (another writer replaced our dir),
+            # never touch the directory and never write into
+            # it; wait and try again.
+            if self._write_owner_file():
+                self.acquired = True
+                self._start_heartbeat(stale)
+                return self
+            time.sleep(LOCK_POLL_SECONDS)
+            continue
+
+    def _write_owner_file(self):
+        """Write our owner file, exclusively; False if we lost the race.
+
+        The owner file is created with mode "x", so it fails
+        rather than overwriting an owner file another writer
+        already placed in this directory. That closes the
+        resume-after-delete interleaving: a writer paused
+        between mkdir and the owner write, whose directory was
+        broken as stale and replaced, must not write its token
+        into the new owner's lock. A generic OSError from the
+        create itself is different: the directory at lock_path
+        may no longer be ours at all -- it may already be a
+        replacement writer's lock -- and no check here can
+        prove otherwise. A replacement directory is just as
+        empty and fresh as our own, and any identity check
+        (age, emptiness, owner file) is a separate operation
+        from the delete, so the directory could still be
+        swapped between the check and the delete. The only
+        correct action is to delete nothing: fail cleanly and
+        leave the directory for later stale cleanup. The
+        conservative cost is that a genuinely own directory
+        left behind strands the project until it ages past
+        the unknown-owner second threshold (ten times stale),
+        because it has no owner file to prove its owner dead;
+        a stranded lock is never a deleted live one.
+        Returns True on success, False when the file already
+        exists or the directory is gone (the caller retries).
+        """
+        self.owner_token = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
         try:
-            self.owner_token = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
-            with open(os.path.join(self.lock_path, "owner"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(self.lock_path, "owner"), "x", encoding="utf-8") as handle:
                 handle.write("pid=%d time=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
                 handle.write("token=%s\n" % self.owner_token)
-            self.token_written = True
+        except FileExistsError:
+            return False
+        except FileNotFoundError:
+            return False
         except OSError:
-            pass
-        self.acquired = True
-        return self
+            # Delete nothing. The directory at lock_path may be
+            # a replacement writer's lock, and nothing proves
+            # it is still the directory we created, so removing
+            # it could delete another writer's lock. Leave it
+            # for stale cleanup and fail cleanly; the error
+            # message is now literally true.
+            sys.stderr.write(
+                "error: could not write the lock ownership file in %s; "
+                "no files were changed.\n" % self.lock_path
+            )
+            sys.exit(1)
+        self.token_written = True
+        return True
 
     def __exit__(self, exc_type, exc, tb):
         if self.acquired:
-            # Only delete the lock when it is still ours. If a new
-            # owner broke our stale lock and took over, the token on
-            # disk no longer matches, and the directory stays put.
-            # If the token cannot be read at all, fail safe and
-            # leave the directory: the stale-break will clear it.
-            if self._owns_lock():
-                shutil.rmtree(self.lock_path, ignore_errors=True)
+            # Stop the heartbeat first: from here on the lock
+            # dir must go stale on its own schedule, and the
+            # thread must never touch a dir we have renamed
+            # aside or handed to a new owner.
+            self._stop_heartbeat()
+            # Rename-then-verify: the ownership decision is made on
+            # the renamed copy, not on a dir a takeover can replace
+            # between a check and a delete. Only a copy whose token
+            # still matches ours is deleted. Anything else is put
+            # back if lock_path is free, and never deleted. If
+            # lock_path is occupied by a newer owner, the renamed
+            # dir is left in place (see the class docstring): a
+            # later acquire cleans it up once it is stale.
+            trash = self._rename_lock_to_trash()
+            if trash is not None:
+                if (
+                    self.owner_token is not None
+                    and self._read_owner_token_from(trash) == self.owner_token
+                ):
+                    self._delete_trash(trash)
+                else:
+                    self._restore_trash(trash)
             self.acquired = False
         return False
 
@@ -707,7 +1119,21 @@ CONFIG_RANGES = {
 
 
 def config_range_error(key, value):
-    """Return an error string when value is outside its range, else None."""
+    """Return an error string when value is outside its range, else None.
+
+    Non-finite floats are rejected explicitly: NaN passes every
+    plain `<` / `>` comparison, so a bare range check would accept
+    it, and a NaN lock timeout would make a writer wait forever.
+    Booleans are rejected too: int(True) is 1 in Python, so a JSON
+    `true` must never silently become a config value.
+    """
+    if isinstance(value, bool):
+        return "error: %s must be a number, not a boolean (got %s)\n" % (
+            key,
+            value,
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        return "error: %s must be a finite number (got %s)\n" % (key, value)
     low, high = CONFIG_RANGES[key]
     if value < low or value > high:
         return "error: %s must be between %s and %s (got %s)\n" % (
@@ -757,9 +1183,16 @@ def load_config(directory):
         else:
             for key, caster in CONFIG_KEYS.items():
                 if key in raw:
+                    if isinstance(raw[key], bool):
+                        warnings.append(
+                            "warning: ignoring invalid value for %s in "
+                            ".statecat/config; using default %s"
+                            % (key, config[key])
+                        )
+                        continue
                     try:
                         value = caster(raw[key])
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         warnings.append(
                             "warning: ignoring invalid value for %s in "
                             ".statecat/config; using default %s"
@@ -775,6 +1208,25 @@ def load_config(directory):
                         )
                         continue
                     config[key] = value
+    # lock_stale must be greater than lock_timeout, or a waiter
+    # can have its lock broken as stale while it is still
+    # waiting for it. A JSON file that states an inconsistent
+    # pair warns and falls back to the defaults for both lock
+    # timings, rather than silently accepting the pair.
+    if config["lock_stale"] <= config["lock_timeout"]:
+        warnings.append(
+            "warning: ignoring lock_stale/lock_timeout pair in "
+            ".statecat/config (lock_stale %s is not greater than "
+            "lock_timeout %s); using defaults %s / %s"
+            % (
+                config["lock_stale"],
+                config["lock_timeout"],
+                DEFAULT_CONFIG["lock_timeout"],
+                DEFAULT_CONFIG["lock_stale"],
+            )
+        )
+        config["lock_timeout"] = DEFAULT_CONFIG["lock_timeout"]
+        config["lock_stale"] = DEFAULT_CONFIG["lock_stale"]
     if warnings and not _config_warnings_printed:
         for warning in warnings:
             sys.stderr.write(warning + "\n")
@@ -807,6 +1259,26 @@ def cmd_config(args):
             sys.stderr.write(range_error)
             return 1
         config = load_config(directory)
+        # lock_stale must be greater than lock_timeout, or a
+        # waiter can have its lock broken as stale while it is
+        # still waiting for it. Reject the pair here, with the
+        # order in which to fix it: raise lock_stale first
+        # before raising lock_timeout, lower lock_timeout
+        # first before lowering lock_stale.
+        if key == "lock_stale" and value <= config["lock_timeout"]:
+            sys.stderr.write(
+                "error: lock_stale (%s) must be greater than "
+                "lock_timeout (%s); lower lock_timeout first "
+                "or raise lock_stale\n" % (value, config["lock_timeout"])
+            )
+            return 1
+        if key == "lock_timeout" and value >= config["lock_stale"]:
+            sys.stderr.write(
+                "error: lock_timeout (%s) must be less than "
+                "lock_stale (%s); raise lock_stale first or "
+                "lower lock_timeout\n" % (value, config["lock_stale"])
+            )
+            return 1
         config[key] = value
         save_config(directory, config)
         print("set %s = %s" % (key, value))

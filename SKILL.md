@@ -90,7 +90,8 @@ existing project, and `pointer` just prints it.
   (JSON) tunes stale days, size budget, backup count, and lock
   timing; `config` prints the effective settings, `config set`
   changes one key and rejects out-of-range values with an error
-  naming the valid range. A config file that is not valid JSON
+  naming the valid range, and rejects non-finite numbers (nan,
+  inf) and booleans outright. A config file that is not valid JSON
   warns and falls back to defaults.
 
 ## Parked: soft protection, admitted
@@ -156,8 +157,36 @@ is calling it, and a hand edit bypasses it entirely.
   cross-platform lock directory (`.statecat/lock`). A second
   writer waits up to 10 seconds, then fails cleanly and changes
   nothing. A lock left behind by a crashed process is broken
-  after 60 seconds. The lock carries a random owner token, and
-  release only deletes the lock when that token still matches.
+  after 60 seconds, but only when its owner is proved dead: the owner
+  PID in the lock's owner file is checked, a live owner is
+  never deleted however old the lock looks, and unknown
+  ownership is not treated as dead -- a lock with no owner
+  file, or an indeterminate liveness check, is only broken
+  after ten times the stale limit. A heartbeat
+  keeps a held lock's directory fresh while its writer works,
+  and the owner file is created exclusively, so a writer whose
+  lock directory was replaced can never write its token into
+  the new owner's lock. A PID recorded in the owner file can
+  be reused by an unrelated process after the owner dies, and
+  that strands the lock until that process exits; the heartbeat
+  does not fix it.
+  The lock carries a random owner token, and
+  release and stale removal rename the lock directory aside
+  first, verify the token or the age on the renamed copy, and
+  only delete it when the copy is still theirs or still stale;
+  a copy that belongs to someone else, or is fresh, is put back
+  and never deleted, and a restore never renames over an
+  existing lock directory. `lock_stale` must be greater than
+  `lock_timeout` in `config set` and in JSON config; env
+  overrides get the same range bounds with a warning and a
+  fallback, and only warn on a stale-not-greater-than-timeout
+  pair. A writer that cannot record its owner
+  token fails cleanly instead of proceeding unwitnessed,
+  and deletes nothing: the directory at the lock path may
+  already be a replacement writer's lock, so it is left for
+  stale cleanup. A genuinely own directory left behind
+  strands the project until it ages past ten times the
+  stale limit.
   Read-only commands do not take the lock.
 
 ## Manual rules: no CLI available

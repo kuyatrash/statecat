@@ -51,6 +51,19 @@ def read_text(path):
         return handle.read()
 
 
+def simulate_dead_owner(lock_path):
+    """Rewrite a lock's owner file to a dead PID, for stale tests.
+
+    A live owner must never be broken as stale, so tests that
+    age a lock held by this process must first make its owner
+    dead (and stop its heartbeat, so the lock can go stale).
+    """
+    owner_path = os.path.join(lock_path, "owner")
+    text = re.sub(r"^pid=\d+", "pid=999999", read_text(owner_path), flags=re.M)
+    with open(owner_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def read_bytes(path):
     with open(path, "rb") as handle:
         return handle.read()
@@ -1004,6 +1017,11 @@ class StateCatTest(unittest.TestCase):
             first.__enter__()
             self.assertIsNotNone(first.owner_token)
             # Age the lock so a second writer treats it as stale.
+            # Simulate a crashed writer first: stop the heartbeat
+            # and record a dead owner PID. A live owner (this
+            # test process) must never be broken as stale.
+            first._stop_heartbeat()
+            simulate_dead_owner(lock_path)
             old = time.time() - 3600
             os.utime(lock_path, (old, old))
             second = statecat.project_lock(self.dir)
@@ -1017,6 +1035,178 @@ class StateCatTest(unittest.TestCase):
             self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
             # The current owner releasing normally does delete it.
             second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_lock_release_race_takeover_between_rename_and_check_survives(self):
+        # The exact interleaving ChatGPT flagged: a writer's release
+        # checks ownership, a takeover happens, then the release
+        # deletes. The old check-then-delete code lost the new
+        # owner's lock here. The fix renames the dir aside first,
+        # so the takeover is injected between the rename and the
+        # token check on the renamed copy, and the new owner's
+        # lock must survive.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            holder = {}
+            test_dir = self.dir
+            real_read = statecat.project_lock._read_owner_token_from
+
+            def injected_read(self, directory):
+                if "second" not in holder:
+                    second = statecat.project_lock(test_dir)
+                    second.__enter__()
+                    holder["second"] = second
+                return real_read(self, directory)
+
+            statecat.project_lock._read_owner_token_from = injected_read
+            try:
+                first.__exit__(None, None, None)
+            finally:
+                statecat.project_lock._read_owner_token_from = real_read
+            self.assertIn("second", holder)
+            second = holder["second"]
+            self.assertTrue(os.path.isdir(lock_path))
+            self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
+            second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_lock_stale_removal_restores_fresh_lock_instead_of_deleting(self):
+        # A lock that looks stale at the age check may be fresh by
+        # the time it is renamed aside (a new owner took over in
+        # between). The stale path must put a fresh dir back, not
+        # delete it; only a still-stale dir is deleted, on the next
+        # pass. Fault-injected deterministically via the age check.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            # Simulate a crashed writer: stop the heartbeat and
+            # record a dead owner PID, or the aged lock could
+            # never be broken as stale (a live owner is kept).
+            first._stop_heartbeat()
+            simulate_dead_owner(lock_path)
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            deletes = []
+            real_delete = statecat.project_lock._delete_trash
+            real_stale = statecat.project_lock._is_stale_dir
+            calls = {"n": 0}
+
+            def injected_stale(self, directory, stale):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return False
+                return real_stale(self, directory, stale)
+
+            def counting_delete(self, trash):
+                deletes.append(trash)
+                return real_delete(self, trash)
+
+            statecat.project_lock._is_stale_dir = injected_stale
+            statecat.project_lock._delete_trash = counting_delete
+            try:
+                second = statecat.project_lock(self.dir)
+                second.__enter__()
+            finally:
+                statecat.project_lock._is_stale_dir = real_stale
+                statecat.project_lock._delete_trash = real_delete
+            # The aged lock was put back once, then broken as stale
+            # on the next pass: exactly one delete, by the stale path.
+            self.assertEqual(len(deletes), 1)
+            self.assertTrue(os.path.isdir(lock_path))
+            self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
+            second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+            # The first writer releasing after its lock is gone is
+            # a no-op, not an error.
+            first.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_lock_acquisition_fails_when_owner_file_cannot_be_written(self):
+        # A writer that cannot record its owner token must fail
+        # cleanly, not proceed unwitnessed and strand the project
+        # behind a lock it can never prove is its own. It must
+        # also delete nothing: the directory at the lock path
+        # may already be a replacement writer's lock, and
+        # nothing proves it is still ours, so it is left behind
+        # for stale cleanup instead of being removed.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        real_open = open
+
+        def failing_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            # The owner file is created exclusively ("x"); a
+            # write-mode ("w") check would miss the failure.
+            if (
+                isinstance(path, str)
+                and path.endswith(os.path.join("lock", "owner"))
+                and ("w" in str(mode) or "x" in str(mode))
+            ):
+                raise OSError("simulated owner write failure")
+            return real_open(path, *args, **kwargs)
+
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            with mock.patch("builtins.open", side_effect=failing_open):
+                lock = statecat.project_lock(self.dir)
+                with self.assertRaises(SystemExit) as caught:
+                    lock.__enter__()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertFalse(lock.acquired)
+                # The lock dir is left behind, not removed: it
+                # may be a replacement writer's lock, and the
+                # writer cannot prove it is still its own.
+                self.assertTrue(os.path.isdir(lock_path))
+            # A later writer can acquire once the leftover dir
+            # ages past the unknown-owner second threshold
+            # (ten times the stale limit, 10 seconds here).
+            old = time.time() - 11
+            os.utime(lock_path, (old, old))
+            lock = statecat.project_lock(self.dir)
+            lock.__enter__()
+            self.assertTrue(lock.acquired)
+            lock.__exit__(None, None, None)
             self.assertFalse(os.path.isdir(lock_path))
         finally:
             for key, value in old_env.items():
@@ -1044,6 +1234,377 @@ class StateCatTest(unittest.TestCase):
         self.assertEqual(config["backups_kept"], 20)
         self.assertEqual(config["lock_timeout"], 10.0)
         self.assertEqual(config["lock_stale"], 60.0)
+
+    def test_config_set_rejects_non_finite_values(self):
+        # NaN passes every plain `<` / `>` comparison, so a bare
+        # range check accepts it; a NaN lock timeout would then
+        # make a writer wait forever. inf is caught by the range
+        # check, but must be rejected as non-finite too.
+        self.init_project()
+        for key, value in (
+            ("lock_timeout", "nan"),
+            ("lock_timeout", "inf"),
+            ("lock_stale", "nan"),
+            ("lock_stale", "inf"),
+        ):
+            result = run_cli(self.dir, "config", "set", key, value)
+            self.assertNotEqual(result.returncode, 0, (key, value))
+            self.assertIn("finite", result.stderr, (key, value))
+        # -inf cannot be passed on the command line (argparse
+        # treats it as an option), so check it through the
+        # validator itself, as well as nan/inf for float keys.
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        for key in ("lock_timeout", "lock_stale"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                self.assertIn("finite", statecat.config_range_error(key, value))
+        config = json.loads(run_cli(self.dir, "config").stdout)
+        self.assertEqual(config["lock_timeout"], 10.0)
+        self.assertEqual(config["lock_stale"], 60.0)
+
+    def test_config_file_rejects_non_finite_and_bool_values(self):
+        # The same holes through a hand-edited JSON config file:
+        # NaN / Infinity tokens and JSON booleans must warn and
+        # fall back to defaults, never be stored or coerced
+        # (int(True) is 1 in Python).
+        self.init_project()
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"lock_timeout": NaN, "lock_stale": Infinity, '
+                '"stale_days": true, "backups_kept": false}'
+            )
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignoring", result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(config["lock_timeout"], 10.0)
+        self.assertEqual(config["lock_stale"], 60.0)
+        self.assertEqual(config["stale_days"], 14)
+        self.assertEqual(config["backups_kept"], 20)
+        # And a non-finite value written as a JSON string.
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write('{"lock_timeout": "nan"}')
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignoring", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["lock_timeout"], 10.0)
+
+    # --- P2 fix round 2026-11-04 (ChatGPT P1 re-check follow-ups) ---
+    def test_stale_lock_with_live_owner_is_never_broken(self):
+        # Age alone must not kill a live writer: an aged lock
+        # whose owner PID is still alive is not abandoned,
+        # however old its directory looks.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=%d time=2026-11-04T00:00:00\n" % os.getpid())
+            handle.write("token=live-owner-token\n")
+        old = time.time() - 3600
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by live owner",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lock is held", result.stderr)
+        self.assertTrue(os.path.isdir(lock_path))
+        self.assertIn("live-owner-token", read_text(os.path.join(lock_path, "owner")))
+        self.assertNotIn("blocked by live owner", read_text(state_path(self.dir)))
+
+    def test_stale_lock_with_dead_owner_is_broken(self):
+        # The same aged lock, but with a dead owner PID, must
+        # still be broken as stale: abandonment is age plus a
+        # dead owner, not age alone and not liveness alone.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999 time=2026-11-04T00:00:00\n")
+            handle.write("token=dead-owner-token\n")
+        old = time.time() - 3600
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "after dead lock",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("after dead lock", read_text(state_path(self.dir)))
+        self.assertFalse(os.path.isdir(lock_path))
+
+    def test_heartbeat_keeps_held_lock_fresh(self):
+        # While a lock is held, the heartbeat touches its
+        # directory mtime, so a long-running writer's lock
+        # does not go stale under it.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            lock = statecat.project_lock(self.dir)
+            lock.__enter__()
+            try:
+                self.assertIsNotNone(lock._heartbeat_thread)
+                self.assertTrue(lock._heartbeat_thread.is_alive())
+                time.sleep(2.5)
+                age = time.time() - os.path.getmtime(lock_path)
+                self.assertLess(age, 1.0, "heartbeat did not refresh the lock")
+            finally:
+                lock.__exit__(None, None, None)
+            self.assertIsNone(lock._heartbeat_thread)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_restore_trash_never_overwrites_existing_lock(self):
+        # On POSIX, os.rename can replace an existing empty
+        # directory, so an unchecked restore could destroy a
+        # third writer's just-created lock. _restore_trash
+        # must decline when lock_path already exists, leaving
+        # both the fresh lock and the trash dir untouched.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        trash = os.path.join(self.dir, ".statecat", "lock.gone-1-abc")
+        os.makedirs(trash)
+        with open(os.path.join(trash, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999\ntoken=old-owner\n")
+        os.makedirs(lock_path)
+        lock = statecat.project_lock(self.dir)
+        self.assertFalse(lock._restore_trash(trash))
+        self.assertTrue(os.path.isdir(lock_path))
+        self.assertFalse(os.path.exists(os.path.join(lock_path, "owner")))
+        self.assertTrue(os.path.isdir(trash))
+
+    def test_env_lock_timing_out_of_range_falls_back_to_config(self):
+        # Env overrides get the same range bounds as `config
+        # set`: 0.01 and 999999 are finite, so a finite-only
+        # check would accept them, but they are outside the
+        # configured ranges and must fall back to config.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock = statecat.project_lock(self.dir)
+        config = statecat.load_config(self.dir)
+        cases = (
+            ({"STATECAT_LOCK_TIMEOUT": "0.01"}, (10.0, 60.0)),
+            ({"STATECAT_LOCK_TIMEOUT": "999999"}, (10.0, 60.0)),
+            ({"STATECAT_LOCK_STALE": "0.01"}, (10.0, 60.0)),
+            ({"STATECAT_LOCK_STALE": "999999"}, (10.0, 60.0)),
+            ({"STATECAT_LOCK_TIMEOUT": "nan"}, (10.0, 60.0)),
+            ({"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "120"}, (5.0, 120.0)),
+        )
+        old_env = {key: os.environ.get(key) for key in ("STATECAT_LOCK_TIMEOUT", "STATECAT_LOCK_STALE")}
+        try:
+            for env, expected in cases:
+                for key in old_env:
+                    os.environ.pop(key, None)
+                os.environ.update(env)
+                self.assertEqual(lock._resolve_lock_timing(config), expected, env)
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_config_rejects_stale_not_greater_than_timeout(self):
+        # lock_stale must be greater than lock_timeout, or a
+        # waiter can have its lock broken as stale while it
+        # is still waiting. `config set` rejects the pair;
+        # JSON config warns and falls back to the defaults
+        # for both timings; env overrides only warn and keep
+        # working (they are the test escape hatch).
+        self.init_project()
+        result = run_cli(self.dir, "config", "set", "lock_stale", "5")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("must be greater than", result.stderr)
+        result = run_cli(self.dir, "config", "set", "lock_timeout", "100")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("must be less than", result.stderr)
+        config = json.loads(run_cli(self.dir, "config").stdout)
+        self.assertEqual(config["lock_timeout"], 10.0)
+        self.assertEqual(config["lock_stale"], 60.0)
+        # A valid order works: raise stale first, then timeout.
+        result = run_cli(self.dir, "config", "set", "lock_stale", "200")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(self.dir, "config", "set", "lock_timeout", "100")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # JSON config with an inconsistent pair warns and
+        # falls back to the defaults for both timings.
+        with open(os.path.join(self.dir, ".statecat", "config"), "w", encoding="utf-8") as handle:
+            handle.write('{"lock_timeout": 100, "lock_stale": 60}')
+        result = run_cli(self.dir, "config")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignoring lock_stale/lock_timeout pair", result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(config["lock_timeout"], 10.0)
+        self.assertEqual(config["lock_stale"], 60.0)
+        # Env overrides keep the pair (warning only), so the
+        # test harness can still use timeout 5 / stale 1.
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock = statecat.project_lock(self.dir)
+        config = statecat.load_config(self.dir)
+        old_env = {key: os.environ.get(key) for key in ("STATECAT_LOCK_TIMEOUT", "STATECAT_LOCK_STALE")}
+        try:
+            os.environ.update({"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"})
+            self.assertEqual(lock._resolve_lock_timing(config), (5.0, 1.0))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_ownerless_stale_lock_is_not_broken_in_normal_window(self):
+        # Unknown is not dead: an aged lock with no owner file
+        # at all may belong to a writer paused between mkdir
+        # and writing its owner file, so it must not be broken
+        # just because it looks stale.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"},
+            "add", "Open", "blocked by ownerless lock",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lock is held", result.stderr)
+        self.assertTrue(os.path.isdir(lock_path))
+        self.assertNotIn("blocked by ownerless lock", read_text(state_path(self.dir)))
+
+    def test_indeterminate_liveness_is_not_treated_as_dead(self):
+        # A recorded PID whose liveness cannot be established
+        # (mocked _pid_is_alive returning None) is unknown,
+        # not dead: the lock survives the normal stale window
+        # and is only abandoned past the second threshold.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999 time=2026-11-04T00:00:00\ntoken=unknown-owner\n")
+        lock = statecat.project_lock(self.dir)
+        with mock.patch.object(statecat, "_pid_is_alive", return_value=None):
+            old = time.time() - 120
+            os.utime(lock_path, (old, old))
+            self.assertFalse(lock._is_abandoned_dir(lock_path, 60))
+            old = time.time() - 601
+            os.utime(lock_path, (old, old))
+            self.assertTrue(lock._is_abandoned_dir(lock_path, 60))
+        self.assertTrue(os.path.isdir(lock_path))
+
+    def test_ownerless_lock_recovered_after_second_threshold(self):
+        # The recovery path for a genuinely dead ownerless lock
+        # (writer crashed between mkdir and its owner write, or
+        # a hand-made empty lock dir) is ten times the stale
+        # limit. Both sides of the boundary, with stale=1 so
+        # the threshold is 10 seconds: aged 9s it survives,
+        # aged 11s it is broken and the writer succeeds.
+        self.init_project()
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        old = time.time() - 9
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "1"},
+            "add", "Open", "blocked just under threshold",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lock is held", result.stderr)
+        self.assertTrue(os.path.isdir(lock_path))
+        old = time.time() - 11
+        os.utime(lock_path, (old, old))
+        result = run_cli_env(
+            self.dir, {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"},
+            "add", "Open", "after ownerless recovery",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("after ownerless recovery", read_text(state_path(self.dir)))
+        self.assertFalse(os.path.isdir(lock_path))
+
+    def test_owner_file_is_created_exclusively(self):
+        # A writer whose lock directory was broken and replaced
+        # must not write its owner token into the new owner's
+        # lock. The owner file is created with mode "x", so
+        # _write_owner_file refuses when one already exists
+        # and leaves the existing file untouched.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=999999\ntoken=other-owner\n")
+        lock = statecat.project_lock(self.dir)
+        self.assertFalse(lock._write_owner_file())
+        self.assertIn("token=other-owner", read_text(os.path.join(lock_path, "owner")))
+        os.remove(os.path.join(lock_path, "owner"))
+        self.assertTrue(lock._write_owner_file())
+        self.assertIn(lock.owner_token, read_text(os.path.join(lock_path, "owner")))
+
+    def test_owner_write_oserror_never_deletes_replacement_lock(self):
+        # A generic OSError while writing the owner file must
+        # never delete the lock directory: the directory at
+        # lock_path may already be a replacement writer's lock,
+        # and nothing here proves it is still ours. A writer
+        # paused after mkdir, whose directory was broken and
+        # replaced, resumes into a lock it does not own; if
+        # its owner-file create then raises a generic OSError
+        # (here a PermissionError, as on an inaccessible
+        # replacement directory), the cleanup must fail cleanly
+        # and leave the replacement lock untouched.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+            handle.write("pid=%d time=2026-11-04T00:00:00\n" % os.getpid())
+            handle.write("token=replacement-owner-token\n")
+        real_open = open
+
+        def failing_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if (
+                isinstance(path, str)
+                and path.endswith(os.path.join("lock", "owner"))
+                and "x" in str(mode)
+            ):
+                raise PermissionError("simulated owner write failure")
+            return real_open(path, *args, **kwargs)
+
+        lock = statecat.project_lock(self.dir)
+        with mock.patch("builtins.open", side_effect=failing_open):
+            with self.assertRaises(SystemExit) as caught:
+                lock._write_owner_file()
+            self.assertEqual(caught.exception.code, 1)
+        self.assertFalse(lock.acquired)
+        # The replacement writer's lock survives untouched.
+        self.assertTrue(os.path.isdir(lock_path))
+        self.assertIn("replacement-owner-token", read_text(os.path.join(lock_path, "owner")))
 
     def test_malformed_config_warns_and_uses_defaults(self):
         self.init_project()

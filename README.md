@@ -316,7 +316,19 @@ hand-edited config can never break the CLI. `config set` rejects
 out-of-range values with an error naming the valid range
 (stale_days 0-1000000, size_lines 1-1000000, size_bytes
 1-1000000000, backups_kept 0-1000, lock_timeout 0.1-3600,
-lock_stale 1-86400). A config file that is not valid JSON warns
+lock_stale 1-86400), and rejects non-finite numbers (nan, inf)
+and booleans outright: a JSON `true` is never coerced to 1,
+and a NaN lock timeout can never make a writer wait forever.
+`lock_stale` must be greater than `lock_timeout`: `config set`
+rejects a pair that is not, and a JSON config stating such a
+pair warns and falls back to the defaults for both lock
+timings. Environment overrides (`STATECAT_LOCK_TIMEOUT`,
+`STATECAT_LOCK_STALE`) get the same range bounds as `config
+set`, with a warning and a fallback to the config value when
+out of range, but a stale-not-greater-than-timeout env pair
+only warns, so the overrides stay usable as a test escape
+hatch.
+A config file that is not valid JSON warns
 on stderr and falls back to defaults instead of silently
 ignoring the breakage. The config file is
 local only: it lives under `.statecat/`, which `init` gitignores.
@@ -330,10 +342,45 @@ won. Writes now run under a cross-platform lock directory
 the last write. A second writer waits up to 10 seconds, then
 fails cleanly with "the lock is held" and changes nothing. A lock
 left behind by a crashed process is broken after 60 seconds.
-The lock carries a random owner token, and release only deletes
-the lock when that token still matches, so a writer whose lock
-was broken as stale while it was paused cannot delete a new
-owner's lock on its way out.
+The lock carries a random owner token. Release and stale removal
+never check-then-delete in place: they rename the lock directory
+aside first (atomic), verify the token or the age on the renamed
+copy, and only delete it when the copy is still theirs or still
+stale. A copy that belongs to someone else, or is fresh, is put
+back if the lock path is free, and never deleted. A stale lock
+is only broken when its directory is old *and* its owner is
+proved dead: the owner PID recorded in the lock's owner file is
+checked, and a live owner is never deleted, however old the
+lock looks. Unknown is not dead: a lock whose owner cannot be
+determined -- no owner file yet, an unreadable owner file, or
+a liveness check that returns indeterminate -- is not broken
+in the normal stale window at all, only after ten times the
+stale limit, so a writer paused between creating the lock
+directory and writing its owner file is not deleted out from
+under itself. The owner file is created exclusively, so a
+writer whose directory was broken and replaced can never
+write its token into the new owner's lock; it waits and
+retries instead. While a lock is held, a daemon heartbeat thread
+touches its directory mtime every few seconds, so a
+long-running but alive writer's lock stays fresh. Restoration
+never renames over an existing lock directory: if a lock
+already sits at the lock path, the renamed copy is left in
+place for later stale cleanup instead. Residual limitation,
+stated honestly: the existence check before a restore and
+the rename itself are two steps, so a lock directory created
+in exactly that window could still be replaced on POSIX; a
+PID recorded in the owner file can be reused by an unrelated
+process after the owner dies, and that strands the lock --
+the liveness check reports the reused PID as alive, so the
+lock is treated as live until that process exits, and the
+heartbeat does not fix it, because the original owner's
+heartbeat died with it. A writer that
+cannot record its owner token fails cleanly instead of
+proceeding unwitnessed, and deletes nothing: the directory
+at the lock path may already be a replacement writer's lock,
+and nothing proves it is still ours, so it is left for stale
+cleanup. A genuinely own directory left behind strands the
+project until it ages past ten times the stale limit.
 Read-only commands (`show`, `check` without `--fix`, `search`,
 `status`, `diff`) do not take the lock.
 
