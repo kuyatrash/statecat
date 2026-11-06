@@ -227,7 +227,7 @@ class StateFile:
         self.orphan_lines = []  # list of (line_index, content)
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8", newline="") as handle:
+                with open(path, "r", encoding="utf-8-sig", newline="") as handle:
                     raw = handle.readlines()
             except UnicodeDecodeError:
                 # A file with invalid UTF-8 must fail cleanly, never
@@ -1346,7 +1346,7 @@ def load_config(directory):
     config = dict(DEFAULT_CONFIG)
     warnings = []
     try:
-        with open(config_path(directory), "r", encoding="utf-8") as handle:
+        with open(config_path(directory), "r", encoding="utf-8-sig") as handle:
             raw = json.load(handle)
     except OSError:
         return config
@@ -1664,7 +1664,7 @@ def install_pointer(directory, create=True):
             return None
         return "created AGENTS.md with pointer"
     try:
-        with open(target, "r", encoding="utf-8", newline="") as handle:
+        with open(target, "r", encoding="utf-8-sig", newline="") as handle:
             content = handle.read()
     except OSError as exc:
         sys.stderr.write("warning: could not read %s: %s\n" % (target, exc))
