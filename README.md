@@ -134,10 +134,14 @@ python3 statecat.py diff
 
 `show --json` prints the same state as machine-readable JSON
 (project, last ID, and one item list per bucket) for agents that
-would rather parse JSON than Markdown. `status` prints a compact
+would rather parse JSON than Markdown. Each item has `id`, `date`,
+`starred`, `text` (its first line), and `continuation` (its
+hand-wrapped indented lines, stripped; empty for most items).
+`status` prints a compact
 summary: bucket counts, stale waiting items, Last ID used, file
 size, and the check result. `search` finds items by
-case-insensitive text, with `--archive` to include archived items;
+case-insensitive text, including wrapped continuation lines, with
+`--archive` to include archived items;
 when nothing matches it prints "no matches" and exits with code 1.
 `compact` archives Decided items older than N days (default 90),
 with `--dry-run` to preview; it never touches live buckets.

@@ -2253,13 +2253,17 @@ def project_name(state):
     return None
 
 
-def item_to_dict(item):
-    return {
+def item_to_dict(item, parsed=None):
+    data = {
         "id": item.item_id,
         "date": item.item_date,
         "starred": item.starred,
         "text": item.text,
     }
+    if parsed is not None:
+        # Hand-wrapped lines, stripped, so JSON readers see the whole item.
+        data["continuation"] = [parsed.lines[index][0].strip() for index in item.continuation_indices]
+    return data
 
 
 def cmd_show(args):
@@ -2277,7 +2281,7 @@ def cmd_show(args):
             "project": project_name(state),
             "last_id": state.last_id,
             "buckets": {
-                bucket: [item_to_dict(item) for item in state.items if item.bucket == bucket]
+                bucket: [item_to_dict(item, state) for item in state.items if item.bucket == bucket]
                 for bucket in buckets
             },
         }
@@ -2331,27 +2335,34 @@ def cmd_status(args):
     return 0
 
 
+def item_full_text(parsed, item):
+    """An item's text with its hand-wrapped continuation lines joined
+    on, so search finds words that sit on a wrapped line."""
+    parts = [item.text] + [parsed.lines[index][0].strip() for index in item.continuation_indices]
+    return " ".join(part for part in parts if part)
+
+
 def cmd_search(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
-    needle = args.text.lower()
+    needle = args.text.casefold()
     found = []
     for item in state.items:
-        if needle in item.text.lower():
-            found.append((item.bucket, item))
+        if needle in item_full_text(state, item).casefold():
+            found.append((item.bucket, item, item_full_text(state, item)))
     if getattr(args, "archive", False):
         for item in archive.items:
-            if needle in item.text.lower():
-                found.append(("Archived", item))
+            if needle in item_full_text(archive, item).casefold():
+                found.append(("Archived", item, item_full_text(archive, item)))
     if not found:
         print("no matches for %r" % args.text)
         return 1
-    for bucket, item in found:
+    for bucket, item, text in found:
         item_id = "#%d" % item.item_id if item.item_id is not None else "#?"
         item_date = item.item_date or "no date"
         if item.starred:
             item_date += "*"
-        print("- %s [%s] (%s) %s" % (item_id, item_date, bucket, item.text))
+        print("- %s [%s] (%s) %s" % (item_id, item_date, bucket, text))
     return 0
 
 

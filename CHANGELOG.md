@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `search` matches words on an item's hand-wrapped continuation
+  lines, not just its first line, and prints the whole item.
+  Matching uses `casefold()`, so e.g. German `ß` matches `SS`.
+- `show --json` items gain a `continuation` list with their wrapped
+  lines (stripped), so JSON readers no longer lose that text. `text`
+  is unchanged, so existing readers keep working.
 - A bucket heading with trailing whitespace (`## Open  `, often left
   by an editor) no longer blocks every write as a "missing bucket
   heading": the parser already read it as the bucket, but the

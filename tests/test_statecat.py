@@ -975,6 +975,26 @@ class StateCatTest(unittest.TestCase):
             if args[0] != "status":
                 self.assertIn("ship it ✓", result.stdout.decode("utf-8"), args)
 
+    def test_search_finds_words_on_wrapped_continuation_lines(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace(
+            "## Open\n\n",
+            "## Open\n\n- #1 [%s] First line of a wrapped item\n    second line mentions Zebra\n" % TODAY,
+        ).replace("> Last ID used: #0", "> Last ID used: #1")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "search", "zebra")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("#1", result.stdout)
+        self.assertIn("second line mentions Zebra", result.stdout)
+        item = json.loads(run_cli(self.dir, "show", "--json").stdout)["buckets"]["Open"][0]
+        self.assertEqual(item["text"], "First line of a wrapped item")
+        self.assertEqual(item["continuation"], ["second line mentions Zebra"])
+        self.assertEqual(run_cli(self.dir, "archive", "1").returncode, 0)
+        self.assertNotEqual(run_cli(self.dir, "search", "zebra").returncode, 0)
+        self.assertIn("(Archived)", run_cli(self.dir, "search", "zebra", "--archive").stdout)
+
     def test_heading_with_trailing_whitespace_still_works(self):
         self.init_project()
         path = state_path(self.dir)
