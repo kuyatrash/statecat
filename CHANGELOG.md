@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-11-06
 
-Follow-up fixes after the v1.2.0 release (not yet pushed; the
-workflow change needs a push from a real git client, as before).
+Hardening release after v1.2.0. Upgrading: run `check` once.
+`check` is stricter than in 1.2.0: a duplicate bucket heading or a
+second `> Last ID used:` line is now a structural problem that blocks
+writes, and invalid dates and item lines outside any bucket are now
+flagged, so a STATE.md that 1.2.0 accepted may need a small fix.
 
 - Break-test round. Each of these used to crash with a raw
   traceback or misbehave, and each now has a regression test:
