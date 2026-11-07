@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Output is always UTF-8. On Windows a piped stdout (an agent, the
+  SessionStart hook, `| cat`) defaults to the ANSI code page, so
+  `show`, `search`, and `diff` crashed with `UnicodeEncodeError` on
+  any item containing a character outside it, such as a check mark;
+  the hook then silently printed nothing.
+- `compact` archives items in their file order; it used to write
+  them to STATE-ARCHIVE.md in reverse.
+- `diff` reads snapshots BOM-tolerant, like the current files, so a
+  BOM alone is no longer reported as a changed first line (and no
+  longer crashed the Windows output).
+- `pointer --install` keeps a UTF-8 BOM when it upgrades the old
+  wording, and `pointer --uninstall` removes a pointer on a
+  BOM-prefixed first line and keeps the BOM.
 - Bucket spacing fix: `add`, `move`, and `supersede` used to insert
   after the blank line that separates a bucket from the next
   heading, so consecutive items were split by blank lines, and each

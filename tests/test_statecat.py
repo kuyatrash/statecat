@@ -951,9 +951,56 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("removed AGENTS.md", run_cli(sub, "pointer", "--uninstall").stdout)
         self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
 
+    def test_pointer_upgrade_and_uninstall_keep_a_bom(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        with open(agents, "wb") as handle:
+            handle.write(("﻿%s\n# Rules\n" % LEGACY_POINTER).encode("utf-8"))
+        self.assertIn("updated pointer", run_cli(self.dir, "pointer", "--install").stdout)
+        self.assertEqual(read_bytes(agents), ("﻿%s\n# Rules\n" % POINTER).encode("utf-8"))
+        self.assertIn("removed pointer from AGENTS.md", run_cli(self.dir, "pointer", "--uninstall").stdout)
+        self.assertEqual(read_bytes(agents), "﻿# Rules\n".encode("utf-8"))
+
     def test_pointer_install_and_uninstall_are_exclusive(self):
         result = run_cli(self.dir, "pointer", "--install", "--uninstall")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_non_ascii_output_survives_a_non_utf8_stdout(self):
+        # Windows pipes default to the ANSI code page; cp1252 forces that anywhere.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "ship it ✓")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        for args in (["show"], ["show", "Open"], ["search", "ship"], ["status"]):
+            result = subprocess.run([sys.executable, CLI, *args], cwd=self.dir, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, (args, result.stderr.decode("utf-8", "replace")))
+            if args[0] != "status":
+                self.assertIn("ship it ✓", result.stdout.decode("utf-8"), args)
+
+    def test_compact_keeps_archive_in_item_order(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace(
+            "## Decided\n\n",
+            "## Decided\n\n- #1 [2020-01-01] one\n- #2 [2020-01-02] two\n- #3 [2020-01-03] three\n",
+        ).replace("> Last ID used: #0", "> Last ID used: #3")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        self.assertEqual(run_cli(self.dir, "compact", "--older-than", "30").returncode, 0)
+        archived = [line for line in read_text(archive_path(self.dir)).splitlines() if line.startswith("- #")]
+        self.assertEqual([line[:4] for line in archived], ["- #1", "- #2", "- #3"])
+        self.assertIn("## Decided\n\n## Open", read_text(path))
+
+    def test_diff_ignores_a_bom_on_the_snapshot(self):
+        self.init_project()
+        path = state_path(self.dir)
+        original = read_bytes(path)
+        with open(path, "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + original)
+        run_cli(self.dir, "add", "Open", "new item")
+        self.assertEqual(run_cli(self.dir, "restore").returncode, 0)
+        result = run_cli_env(self.dir, {"PYTHONIOENCODING": "utf-8"}, "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("﻿", result.stdout)
+        self.assertNotIn("-# Project", result.stdout)
 
     # Bucket spacing: items stay together and blank lines never pile up.
     def test_consecutive_adds_stay_together_without_blank_lines(self):

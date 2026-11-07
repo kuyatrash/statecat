@@ -1983,9 +1983,11 @@ def install_pointer(directory, create=True):
             return None
         return "created AGENTS.md with pointer"
     try:
-        with open(target, "r", encoding="utf-8-sig", newline="") as handle:
+        # Plain utf-8, not utf-8-sig: a BOM stays in content as
+        # U+FEFF, so the in-place upgrade below writes it back.
+        with open(target, "r", encoding="utf-8", newline="") as handle:
             content = handle.read()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         sys.stderr.write("warning: could not read %s: %s\n" % (target, exc))
         return None
     if POINTER_LINE in content:
@@ -2082,9 +2084,12 @@ def uninstall_pointer(directory):
         try:
             with open(path, "r", encoding="utf-8", newline="") as handle:
                 lines = handle.readlines()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             sys.stderr.write("warning: could not read %s: %s\n" % (path, exc))
             continue
+        bom = ""
+        if lines and lines[0].startswith("﻿"):
+            bom, lines[0] = "﻿", lines[0][1:]
         kept = [line for line in lines if not is_pointer_line(line)]
         if len(kept) == len(lines):
             continue
@@ -2094,7 +2099,7 @@ def uninstall_pointer(directory):
                 os.unlink(path)
                 messages.append("removed %s (it held only the pointer)" % name)
             else:
-                atomic_write_bytes(path, remaining.encode("utf-8"))
+                atomic_write_bytes(path, (bom + remaining).encode("utf-8"))
                 messages.append("removed pointer from %s" % name)
         except OSError as exc:
             sys.stderr.write("warning: could not update %s: %s\n" % (path, exc))
@@ -2642,10 +2647,12 @@ def cmd_compact(args):
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     candidates, _skipped = compact_candidates(state, args.older_than)
-    # Delete in reverse line order so earlier indices stay valid.
-    for item in sorted(candidates, key=lambda candidate: candidate.line_index, reverse=True):
-        block = item_block_lines(state, item)
-        append_block_to_archive(archive, block)
+    # Archive in file order, so the archive keeps the items' order,
+    # then delete in reverse line order so earlier indices stay valid.
+    in_order = sorted(candidates, key=lambda candidate: candidate.line_index)
+    for item in in_order:
+        append_block_to_archive(archive, item_block_lines(state, item))
+    for item in reversed(in_order):
         delete_item_block(state, item)
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     atomic_write(os.path.join(directory, STATE), state.lines)
@@ -2907,7 +2914,9 @@ def cmd_diff(args):
         if not os.path.exists(snapshot_file):
             continue
         try:
-            with open(snapshot_file, "r", encoding="utf-8", newline="") as handle:
+            # utf-8-sig, like StateFile reads the current files, so a
+            # BOM alone never shows up as a changed first line.
+            with open(snapshot_file, "r", encoding="utf-8-sig", newline="") as handle:
                 old = handle.readlines()
         except UnicodeDecodeError:
             fail_cleanly(
@@ -3028,7 +3037,22 @@ def build_parser():
     return parser
 
 
+def use_utf8_output():
+    """State files are UTF-8, so output is too. On Windows a piped
+    stdout (an agent, a hook, `| cat`) defaults to the ANSI code
+    page, and printing any item with a character outside it, such
+    as a check mark, crashed with UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if encoding != "utf8":
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (AttributeError, ValueError, OSError):
+                pass
+
+
 def main(argv=None):
+    use_utf8_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     # Write commands run whole read-modify-write cycles under the
