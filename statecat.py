@@ -431,7 +431,10 @@ class StateFile:
                 continue
             if in_fence:
                 continue
-            if content == "## " + bucket:
+            # Match the heading the way _parse reads it (stripped), so a
+            # trailing space an editor left on "## Open " does not make
+            # the bucket "missing" while the parser sees it fine.
+            if start is None and content.startswith("## ") and content[3:].strip() == bucket:
                 start = index
             elif start is not None and content.startswith("## "):
                 end = index
@@ -1743,6 +1746,16 @@ def cmd_config(args):
             )
             return 1
         config[key] = value
+        # Keep keys this version does not know (from a newer StateCat,
+        # say) instead of silently dropping them from the file.
+        try:
+            with open(config_path(directory), "r", encoding="utf-8-sig") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict):
+            existing.update(config)
+            config = existing
         save_config(directory, config)
         print("set %s = %s" % (key, value))
         return 0
@@ -2701,8 +2714,11 @@ def cmd_check(args):
             sys.stderr.write("error: structural problems must be fixed before --fix can run.\n")
             return 1
         # --fix is exempt from the Parked guard: it only adds IDs/dates.
-        take_snapshot(directory, "pre-write")
-        state, archive = read_state_and_archive(directory)
+        # Fix in memory first and snapshot only when there is something
+        # to write: a no-op --fix used to add an identical snapshot each
+        # run, pushing real ones out of backups_kept and making the
+        # no-op copy the default restore target. The lock is held, so
+        # the files on disk are still the ones read here.
         fixed = []
         today = today_str()
         for item in list(state.items):
@@ -2736,6 +2752,7 @@ def cmd_check(args):
             state.set_last_id(highest)
             counter_fixed = True
         if fixed or counter_fixed:
+            take_snapshot(directory, "pre-write")
             atomic_write(os.path.join(directory, STATE), state.lines)
             for fixed_id in fixed:
                 print("fixed #%d" % fixed_id)

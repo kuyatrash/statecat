@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- A bucket heading with trailing whitespace (`## Open  `, often left
+  by an editor) no longer blocks every write as a "missing bucket
+  heading": the parser already read it as the bucket, but the
+  section lookup used by writes and by check compared it exactly.
+- `check --fix` with nothing to fix no longer takes a snapshot. Each
+  no-op run used to add an identical snapshot, pushing real ones
+  out of `backups_kept` and making the no-op copy the default
+  `restore` target.
+- `config set` keeps keys it does not know (from a newer StateCat,
+  say) instead of dropping them from `.statecat/config`.
 - Output is always UTF-8. On Windows a piped stdout (an agent, the
   SessionStart hook, `| cat`) defaults to the ANSI code page, so
   `show`, `search`, and `diff` crashed with `UnicodeEncodeError` on

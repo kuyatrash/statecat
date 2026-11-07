@@ -975,6 +975,42 @@ class StateCatTest(unittest.TestCase):
             if args[0] != "status":
                 self.assertIn("ship it ✓", result.stdout.decode("utf-8"), args)
 
+    def test_heading_with_trailing_whitespace_still_works(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace("## Open\n", "## Open  \n").replace("## Parked\n", "##  Parked\t\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+        self.assertEqual(run_cli(self.dir, "add", "Open", "after the spaced heading").returncode, 0)
+        self.assertEqual(run_cli(self.dir, "add", "Parked", "parked one").returncode, 0)
+        after = read_text(path)
+        self.assertIn("## Open  \n\n- #1 [%s] after the spaced heading\n" % TODAY, after)
+        self.assertIn("##  Parked\t\n\n- #2 [%s] parked one\n" % TODAY, after)
+        self.assertIn("after the spaced heading", run_cli(self.dir, "show", "Open").stdout)
+
+    def test_config_set_keeps_unknown_keys(self):
+        self.init_project()
+        path = os.path.join(self.dir, ".statecat", "config")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"future_key": "keep me", "stale_days": 7}))
+        result = run_cli(self.dir, "config", "set", "backups_kept", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(read_text(path))
+        self.assertEqual(saved["future_key"], "keep me")
+        self.assertEqual(saved["stale_days"], 7)
+        self.assertEqual(saved["backups_kept"], 5)
+
+    def test_check_fix_with_nothing_to_fix_takes_no_snapshot(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "real change")
+        before = run_cli(self.dir, "restore", "--list").stdout
+        for _ in range(3):
+            result = run_cli(self.dir, "check", "--fix")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("nothing to fix", result.stdout)
+        self.assertEqual(run_cli(self.dir, "restore", "--list").stdout, before)
+
     def test_compact_keeps_archive_in_item_order(self):
         self.init_project()
         path = state_path(self.dir)
