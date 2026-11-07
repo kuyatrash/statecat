@@ -12,7 +12,7 @@ CLAUDE.md when that is the file the project already has), and
 hand only when neither command is available.
 
 ```text
-Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
+Read STATE.md first, then run python3 statecat.py check (py statecat.py check on Windows if python3 is not found), before asking about or working on this project.
 ```
 
 ## Where to put it
@@ -29,7 +29,7 @@ with the common filenames noted here.
 ```markdown
 # Project instructions
 
-Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
+Read STATE.md first, then run python3 statecat.py check (py statecat.py check on Windows if python3 is not found), before asking about or working on this project.
 
 ## Project rules
 ...
@@ -51,5 +51,9 @@ Read STATE.md first, then run python3 ~/workspace/statecat/statecat.py check, be
 
 Alternatively, copy `statecat.py` and the optional `statecat`
 launcher from the repo root into your project root, and the
-pointer can use `./statecat check` on Unix. On Windows, always
-use the `python3 statecat.py check` form.
+pointer can use `./statecat check` on Unix. On Windows, keep the
+`statecat.py check` form above: it names `py` for machines where
+`python3` is only a Microsoft Store stub.
+
+`pointer --uninstall` removes the line again (current or older
+wording) from AGENTS.md and CLAUDE.md.

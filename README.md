@@ -39,13 +39,26 @@ file you already have), and adds `.statecat/` to `.gitignore`, so
 paired backups are never committed. Use `--no-pointer` or
 `--no-gitignore` to skip either step. For a project that already
 has a state file, `python3 statecat.py pointer --install` adds the
-line, and `python3 statecat.py pointer` just prints it.
+line (upgrading an older wording in place instead of adding a
+second line), `python3 statecat.py pointer --uninstall` removes it,
+and `python3 statecat.py pointer` just prints it.
 
 ```text
-Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
+Read STATE.md first, then run python3 statecat.py check (py statecat.py check on Windows if python3 is not found), before asking about or working on this project.
 ```
 
 That pointer, not the skill, is the real read-first mechanism.
+
+For Claude Code, `python3 statecat.py hook --install` also adds a
+SessionStart hook to `.claude/settings.json` that runs `show` and
+`check` at the start of every session (from the next session, or
+after `/clear`). It keeps every existing setting, never adds the
+hook twice, upgrades an older StateCat hook in place, and refuses
+to touch a settings file that is not valid JSON. The file is
+rewritten with two-space indentation. The hook tries `python3`,
+then `py`, then `python`, so it still works on Windows where
+`python3` is a Microsoft Store stub. `hook --uninstall` removes
+only the StateCat entry, and `hook` alone prints the entry.
 
 ## Before and after
 
@@ -87,7 +100,9 @@ This creates `STATE.md`, `STATE-ARCHIVE.md`, and
 `.gitignore`. It refuses to overwrite existing files.
 
 On Windows, `python3` often is not on PATH; use `py` or `python`
-instead, for example `py statecat.py check`. On Unix, if
+instead, for example `py statecat.py check`. The `./statecat`
+launcher (in Git Bash, or any POSIX shell) tries `python3`, then
+`py`, then `python` by itself. On Unix, if
 `./statecat check` gives permission denied on a fresh clone, run
 `chmod +x statecat` once, then try again.
 

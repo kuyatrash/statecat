@@ -1941,10 +1941,23 @@ def lines_from_contents(contents, ending="\n"):
 
 
 POINTER_LINE = (
-    "Read STATE.md first, then run python3 statecat.py check, "
+    "Read STATE.md first, then run python3 statecat.py check "
+    "(py statecat.py check on Windows if python3 is not found), "
     "before asking about or working on this project."
 )
+# Earlier pointer wordings, recognised so install upgrades them in
+# place instead of adding a second line, and uninstall removes them.
+LEGACY_POINTER_LINES = (
+    "Read STATE.md first, then run python3 statecat.py check, "
+    "before asking about or working on this project.",
+)
 POINTER_FILES = ("AGENTS.md", "CLAUDE.md")
+POINTER_CREATED_HEADER = "# Project instructions\n\n"
+
+
+def is_pointer_line(content):
+    stripped = content.strip()
+    return stripped == POINTER_LINE or stripped in LEGACY_POINTER_LINES
 
 
 def install_pointer(directory, create=True):
@@ -1964,7 +1977,7 @@ def install_pointer(directory, create=True):
         target = os.path.join(directory, "AGENTS.md")
         try:
             with open(target, "w", encoding="utf-8", newline="") as handle:
-                handle.write("# Project instructions\n\n%s\n" % POINTER_LINE)
+                handle.write("%s%s\n" % (POINTER_CREATED_HEADER, POINTER_LINE))
         except OSError as exc:
             sys.stderr.write("warning: could not create %s: %s\n" % (target, exc))
             return None
@@ -1977,6 +1990,14 @@ def install_pointer(directory, create=True):
         return None
     if POINTER_LINE in content:
         return "pointer already in %s" % os.path.basename(target)
+    for legacy in LEGACY_POINTER_LINES:
+        if legacy in content:
+            try:
+                atomic_write_bytes(target, content.replace(legacy, POINTER_LINE, 1).encode("utf-8"))
+            except OSError as exc:
+                sys.stderr.write("warning: could not update %s: %s\n" % (target, exc))
+                return None
+            return "updated pointer in %s" % os.path.basename(target)
     try:
         with open(target, "a", encoding="utf-8", newline="") as handle:
             if content and not content.endswith("\n"):
@@ -2048,13 +2069,154 @@ def cmd_init(args):
     return 0
 
 
+def uninstall_pointer(directory):
+    """Remove every pointer line (current or legacy wording) from
+    AGENTS.md and CLAUDE.md. A file that is left holding only the
+    header init wrote when it created the file is deleted, since
+    init made it. Returns a list of short messages."""
+    messages = []
+    for name in POINTER_FILES:
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as handle:
+                lines = handle.readlines()
+        except OSError as exc:
+            sys.stderr.write("warning: could not read %s: %s\n" % (path, exc))
+            continue
+        kept = [line for line in lines if not is_pointer_line(line)]
+        if len(kept) == len(lines):
+            continue
+        remaining = "".join(kept)
+        try:
+            if remaining.replace("\r\n", "\n") in (POINTER_CREATED_HEADER, POINTER_CREATED_HEADER.rstrip("\n") + "\n"):
+                os.unlink(path)
+                messages.append("removed %s (it held only the pointer)" % name)
+            else:
+                atomic_write_bytes(path, remaining.encode("utf-8"))
+                messages.append("removed pointer from %s" % name)
+        except OSError as exc:
+            sys.stderr.write("warning: could not update %s: %s\n" % (path, exc))
+    return messages
+
+
 def cmd_pointer(args):
     if getattr(args, "install", False):
         message = install_pointer(os.getcwd())
         if message:
             print(message)
         return 0
+    if getattr(args, "uninstall", False):
+        messages = uninstall_pointer(os.getcwd())
+        for message in messages:
+            print(message)
+        if not messages:
+            print("no pointer found in %s" % " or ".join(POINTER_FILES))
+        return 0
     print(POINTER_LINE)
+    return 0
+
+
+# Claude Code SessionStart hook. It runs in a POSIX shell (Git Bash on
+# Windows). It tries python3, then py, then python, because on Windows
+# python3 is often a Microsoft Store stub that runs nothing, and the
+# trailing exit 0 would otherwise hide that the hook did nothing.
+HOOK_COMMAND = (
+    'cd "$CLAUDE_PROJECT_DIR" && { P=python3; $P -c \'\' 2>/dev/null || P=py; '
+    "$P -c '' 2>/dev/null || P=python; "
+    "$P statecat.py show && $P statecat.py check; }; exit 0"
+)
+HOOK_SETTINGS = os.path.join(".claude", "settings.json")
+
+
+def hook_entry():
+    return {"hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+
+
+def is_statecat_hook(hook):
+    command = hook.get("command") if isinstance(hook, dict) else None
+    return isinstance(command, str) and "statecat.py show" in command and "statecat.py check" in command
+
+
+def load_hook_settings(path):
+    """Return (settings, error). A missing file gives {}. Anything
+    that is not a JSON object with an object 'hooks' and a list
+    'SessionStart' is an error, so a file we cannot safely merge
+    into is never overwritten."""
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            settings = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return None, "%s is not valid JSON (%s); fix it by hand, nothing was changed" % (path, exc)
+    if not isinstance(settings, dict):
+        return None, "%s is not a JSON object; nothing was changed" % path
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return None, "'hooks' in %s is not an object; nothing was changed" % path
+    if not isinstance(hooks.get("SessionStart", []), list):
+        return None, "'hooks.SessionStart' in %s is not a list; nothing was changed" % path
+    return settings, None
+
+
+def write_hook_settings(path, settings):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    atomic_write_bytes(path, (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
+
+
+def cmd_hook(args):
+    if not (args.install or args.uninstall):
+        print(json.dumps({"hooks": {"SessionStart": [hook_entry()]}}, indent=2))
+        return 0
+    directory = find_project_root() or os.getcwd()
+    path = os.path.join(directory, HOOK_SETTINGS)
+    settings, error = load_hook_settings(path)
+    if error:
+        sys.stderr.write("error: %s\n" % error)
+        return 1
+    groups = settings.get("hooks", {}).get("SessionStart", [])
+    found = [
+        (group, hook)
+        for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        for hook in group["hooks"] if is_statecat_hook(hook)
+    ]
+    if args.install:
+        if any(hook.get("command") == HOOK_COMMAND for _group, hook in found):
+            print("SessionStart hook already in %s" % HOOK_SETTINGS)
+            return 0
+        if found:
+            # An older StateCat command: upgrade the first, drop the rest.
+            found[0][1]["command"] = HOOK_COMMAND
+            for group, hook in found[1:]:
+                group["hooks"].remove(hook)
+            message = "updated SessionStart hook in %s" % HOOK_SETTINGS
+        else:
+            settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(hook_entry())
+            message = "added SessionStart hook to %s" % HOOK_SETTINGS
+    else:
+        if not found:
+            print("no StateCat SessionStart hook in %s" % HOOK_SETTINGS)
+            return 0
+        for group, hook in found:
+            group["hooks"].remove(hook)
+        hooks = settings["hooks"]
+        hooks["SessionStart"] = [
+            group for group in hooks["SessionStart"]
+            if not (isinstance(group, dict) and group.get("hooks") == [])
+        ]
+        if not hooks["SessionStart"]:
+            del hooks["SessionStart"]
+        if not hooks:
+            del settings["hooks"]
+        message = "removed SessionStart hook from %s" % HOOK_SETTINGS
+    try:
+        write_hook_settings(path, settings)
+    except OSError as exc:
+        sys.stderr.write("error: could not write %s: %s\n" % (path, exc))
+        return 1
+    print(message)
     return 0
 
 
@@ -2735,9 +2897,17 @@ def build_parser():
     p.add_argument("--no-gitignore", action="store_true", help="Do not add .statecat/ to .gitignore")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("pointer", help="Print the read-first pointer line, or install it with --install")
-    p.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
+    p = sub.add_parser("pointer", help="Print the read-first pointer line, or install/uninstall it")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
+    group.add_argument("--uninstall", action="store_true", help="Remove the pointer line from AGENTS.md and CLAUDE.md")
     p.set_defaults(func=cmd_pointer)
+
+    p = sub.add_parser("hook", help="Print the Claude Code SessionStart hook, or install/uninstall it")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--install", action="store_true", help="Add the hook to .claude/settings.json, keeping other settings")
+    group.add_argument("--uninstall", action="store_true", help="Remove the StateCat hook from .claude/settings.json")
+    p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("show", help="Print the full state, or one bucket")
     p.add_argument("bucket", nargs="?", help="Bucket name, e.g. Open")

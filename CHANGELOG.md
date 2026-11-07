@@ -30,6 +30,24 @@ flagged, so a STATE.md that 1.2.0 accepted may need a small fix.
     to its target; they used to replace the link with a
     regular file, so the linked file silently stopped updating.
 
+- New `hook` command for Claude Code. `hook --install` adds a
+  SessionStart hook to `.claude/settings.json` (in the project
+  root) that runs `show` and `check` at every session start. It
+  keeps every existing setting, never adds the hook twice,
+  upgrades an older StateCat hook command in place, and refuses
+  with no write when the file is not valid JSON or `hooks` /
+  `hooks.SessionStart` has the wrong type. `hook --uninstall`
+  removes only the StateCat entry; `hook` alone prints it.
+- `python3` is no longer assumed. On Windows it is often a
+  Microsoft Store stub that runs nothing. The hook and the
+  `./statecat` launcher try `python3`, then `py`, then `python`,
+  and the pointer line now names `py statecat.py check` for
+  Windows. `pointer --install` upgrades the old pointer wording
+  in place instead of adding a second line.
+- New `pointer --uninstall` removes the pointer line (current or
+  older wording) from AGENTS.md and CLAUDE.md, and deletes an
+  AGENTS.md that `init` created if the pointer was all it held.
+
 - `init` and `config set` now run under the project lock, like
   the other writers: two agents init-ing the same empty
   directory can no longer interleave and leave mismatched

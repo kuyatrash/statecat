@@ -23,6 +23,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "statecat.py")
 FIXTURE_DIR = os.path.join(ROOT, "fixture")
 TODAY = date.today().isoformat()
+POINTER = (
+    "Read STATE.md first, then run python3 statecat.py check "
+    "(py statecat.py check on Windows if python3 is not found), "
+    "before asking about or working on this project."
+)
+LEGACY_POINTER = (
+    "Read STATE.md first, then run python3 statecat.py check, "
+    "before asking about or working on this project."
+)
 
 
 def run_cli(cwd, *args):
@@ -890,7 +899,179 @@ class StateCatTest(unittest.TestCase):
     def test_pointer_prints_the_line(self):
         result = run_cli(self.dir, "pointer")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.")
+        self.assertEqual(result.stdout.strip(), POINTER)
+
+    def test_docs_quote_the_current_pointer(self):
+        for filename in ("README.md", "SKILL.md", "AGENTS-pointer.md"):
+            text = read_text(os.path.join(ROOT, filename))
+            self.assertIn(POINTER, text, filename)
+            self.assertNotIn(LEGACY_POINTER, text, filename)
+
+    def test_pointer_install_upgrades_legacy_line_in_place(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Rules\r\n\r\n%s\r\nKeep tests green.\r\n" % LEGACY_POINTER)
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("updated pointer in AGENTS.md", result.stdout)
+        self.assertEqual(
+            read_text(agents),
+            "# Rules\r\n\r\n%s\r\nKeep tests green.\r\n" % POINTER,
+        )
+
+    def test_pointer_uninstall_removes_line_and_keeps_the_rest(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        claude = os.path.join(self.dir, "CLAUDE.md")
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Rules\n%s\nKeep tests green.\n" % POINTER)
+        with open(claude, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Notes\n%s\n" % LEGACY_POINTER)
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed pointer from AGENTS.md", result.stdout)
+        self.assertIn("removed pointer from CLAUDE.md", result.stdout)
+        self.assertEqual(read_text(agents), "# Rules\nKeep tests green.\n")
+        self.assertEqual(read_text(claude), "# Notes\n")
+        again = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertIn("no pointer found", again.stdout)
+
+    def test_pointer_uninstall_deletes_agents_md_that_init_created(self):
+        self.init_project()
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed AGENTS.md", result.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+
+    def test_pointer_install_and_uninstall_are_exclusive(self):
+        result = run_cli(self.dir, "pointer", "--install", "--uninstall")
+        self.assertNotEqual(result.returncode, 0)
+
+    # Claude Code SessionStart hook.
+    def settings_path(self):
+        return os.path.join(self.dir, ".claude", "settings.json")
+
+    def write_settings(self, text):
+        os.makedirs(os.path.dirname(self.settings_path()), exist_ok=True)
+        with open(self.settings_path(), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+
+    def statecat_hook_commands(self):
+        settings = json.loads(read_text(self.settings_path()))
+        return [
+            hook["command"]
+            for group in settings.get("hooks", {}).get("SessionStart", [])
+            for hook in group["hooks"]
+            if "statecat.py show" in hook["command"]
+        ]
+
+    def test_hook_install_creates_settings(self):
+        self.init_project()
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added SessionStart hook", result.stdout)
+        commands = self.statecat_hook_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertIn('cd "$CLAUDE_PROJECT_DIR"', commands[0])
+        self.assertIn("P=py", commands[0])
+        self.assertTrue(commands[0].endswith("exit 0"))
+
+    def test_hook_install_keeps_existing_settings_and_is_idempotent(self):
+        self.init_project()
+        other = {"type": "command", "command": "echo hello"}
+        self.write_settings(json.dumps({
+            "permissions": {"allow": ["Bash(ls)"]},
+            "hooks": {
+                "SessionStart": [{"hooks": [other]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}],
+            },
+        }))
+        self.assertEqual(run_cli(self.dir, "hook", "--install").returncode, 0)
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already in", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings["permissions"], {"allow": ["Bash(ls)"]})
+        self.assertIn("Stop", settings["hooks"])
+        self.assertEqual(settings["hooks"]["SessionStart"][0], {"hooks": [other]})
+        self.assertEqual(len(self.statecat_hook_commands()), 1)
+
+    def test_hook_install_upgrades_old_statecat_command(self):
+        self.init_project()
+        old = 'cd "$CLAUDE_PROJECT_DIR" && python3 statecat.py show && python3 statecat.py check; exit 0'
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": old}]},
+        ]}}))
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("updated SessionStart hook", result.stdout)
+        commands = self.statecat_hook_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertNotEqual(commands[0], old)
+
+    def test_hook_install_refuses_invalid_json(self):
+        self.init_project()
+        self.write_settings('{"hooks": {,}')
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not valid JSON", result.stderr)
+        self.assertEqual(read_text(self.settings_path()), '{"hooks": {,}')
+
+    def test_hook_install_refuses_wrong_shapes(self):
+        self.init_project()
+        for text in ('[]', '{"hooks": []}', '{"hooks": {"SessionStart": {}}}'):
+            self.write_settings(text)
+            result = run_cli(self.dir, "hook", "--install")
+            self.assertNotEqual(result.returncode, 0, text)
+            self.assertEqual(read_text(self.settings_path()), text)
+
+    def test_hook_uninstall_removes_only_statecat_entry(self):
+        self.init_project()
+        other = {"type": "command", "command": "echo hello"}
+        self.write_settings(json.dumps({"model": "x", "hooks": {"SessionStart": [{"hooks": [other]}]}}))
+        run_cli(self.dir, "hook", "--install")
+        result = run_cli(self.dir, "hook", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed SessionStart hook", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings, {"model": "x", "hooks": {"SessionStart": [{"hooks": [other]}]}})
+
+    def test_hook_uninstall_drops_empty_hooks_key(self):
+        self.init_project()
+        run_cli(self.dir, "hook", "--install")
+        run_cli(self.dir, "hook", "--uninstall")
+        self.assertEqual(json.loads(read_text(self.settings_path())), {})
+        again = run_cli(self.dir, "hook", "--uninstall")
+        self.assertIn("no StateCat SessionStart hook", again.stdout)
+
+    def test_hook_installs_at_project_root_from_subfolder(self):
+        self.init_project()
+        sub = os.path.join(self.dir, "src")
+        os.makedirs(sub)
+        result = run_cli(sub, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(self.settings_path()))
+        self.assertFalse(os.path.exists(os.path.join(sub, ".claude")))
+
+    def test_hook_prints_entry_without_writing(self):
+        result = run_cli(self.dir, "hook")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("SessionStart", data["hooks"])
+        self.assertFalse(os.path.exists(self.settings_path()))
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_hook_command_runs_show_and_check(self):
+        self.init_project("Hook Run")
+        shutil.copy(CLI, self.dir)
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        result = subprocess.run(
+            ["sh", "-c", command], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("# Project: Hook Run", result.stdout)
+        self.assertIn("check: clean", result.stdout)
 
     # v1.1: show --json, status, search.
     def test_show_json_is_machine_readable(self):

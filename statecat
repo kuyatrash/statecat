@@ -1,6 +1,13 @@
 #!/bin/sh
-# StateCat launcher (optional, Unix only).
+# StateCat launcher (optional, POSIX shells, including Git Bash).
 # Forwards all arguments to statecat.py in the same directory as this
 # launcher, so `./statecat check` works without typing python3.
-# Windows users: keep using `python3 statecat.py <command>`.
-exec python3 "$(dirname "$0")/statecat.py" "$@"
+# It tries python3, then py, then python, because on Windows python3
+# is often a Microsoft Store stub that runs nothing.
+for p in python3 py python; do
+  if "$p" -c '' >/dev/null 2>&1; then
+    exec "$p" "$(dirname "$0")/statecat.py" "$@"
+  fi
+done
+echo "statecat: no working Python found (tried python3, py, python)" >&2
+exit 127
