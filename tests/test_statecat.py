@@ -942,9 +942,79 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("removed AGENTS.md", result.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
 
+    def test_pointer_install_from_subfolder_uses_project_root(self):
+        self.init_project()
+        sub = os.path.join(self.dir, "src")
+        os.makedirs(sub)
+        self.assertIn("pointer already in AGENTS.md", run_cli(sub, "pointer", "--install").stdout)
+        self.assertFalse(os.path.exists(os.path.join(sub, "AGENTS.md")))
+        self.assertIn("removed AGENTS.md", run_cli(sub, "pointer", "--uninstall").stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+
     def test_pointer_install_and_uninstall_are_exclusive(self):
         result = run_cli(self.dir, "pointer", "--install", "--uninstall")
         self.assertNotEqual(result.returncode, 0)
+
+    # Bucket spacing: items stay together and blank lines never pile up.
+    def test_consecutive_adds_stay_together_without_blank_lines(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "first")
+        run_cli(self.dir, "add", "Open", "second")
+        run_cli(self.dir, "add", "Open", "third")
+        text = read_text(state_path(self.dir))
+        self.assertIn(
+            "## Open\n\n- #1 [%s] first\n- #2 [%s] second\n- #3 [%s] third\n\n## Waiting on human"
+            % (TODAY, TODAY, TODAY),
+            text,
+        )
+
+    def test_add_archive_cycles_do_not_accumulate_blank_lines(self):
+        self.init_project()
+        fresh = read_text(state_path(self.dir))
+        for _ in range(3):
+            run_cli(self.dir, "add", "Open", "temporary")
+            last = json.loads(run_cli(self.dir, "show", "--json").stdout)["last_id"]
+            self.assertEqual(run_cli(self.dir, "archive", str(last)).returncode, 0)
+        after = read_text(state_path(self.dir))
+        self.assertEqual(
+            re.sub(r"> Last ID used: #\d+", "", after),
+            re.sub(r"> Last ID used: #\d+", "", fresh),
+        )
+
+    def test_move_keeps_target_list_together_and_source_tidy(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "kept")
+        run_cli(self.dir, "add", "Open", "promoted")
+        self.assertEqual(run_cli(self.dir, "move", "2", "Decided").returncode, 0)
+        text = read_text(state_path(self.dir))
+        self.assertIn("## Decided\n\n- #1 [%s] kept\n- #2 [%s] promoted\n\n## Open\n\n## Waiting" % (TODAY, TODAY), text)
+
+    def test_archive_into_file_without_final_newline(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "to archive")
+        path = archive_path(self.dir)
+        trimmed = read_text(path).rstrip("\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(trimmed)
+        result = run_cli(self.dir, "archive", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = read_text(path).split("\n")
+        self.assertIn("## Archived", lines)
+        self.assertIn("- #1 [%s] to archive" % TODAY, lines)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+
+    def test_move_last_item_of_file_without_final_newline(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Parked", "last line")
+        path = state_path(self.dir)
+        trimmed = read_text(path).rstrip("\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(trimmed)
+        result = run_cli(self.dir, "move", "1", "Open", "--owner-approved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = read_text(path)
+        self.assertIn("- #1 [%s] last line\n\n## Waiting on human" % TODAY, text)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
 
     # Claude Code SessionStart hook.
     def settings_path(self):
@@ -1034,6 +1104,16 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("removed SessionStart hook", result.stdout)
         settings = json.loads(read_text(self.settings_path()))
         self.assertEqual(settings, {"model": "x", "hooks": {"SessionStart": [{"hooks": [other]}]}})
+
+    def test_hook_uninstall_keeps_groups_the_user_left_empty(self):
+        self.init_project()
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [{"matcher": "startup", "hooks": []}]}}))
+        run_cli(self.dir, "hook", "--install")
+        self.assertEqual(run_cli(self.dir, "hook", "--uninstall").returncode, 0)
+        self.assertEqual(
+            json.loads(read_text(self.settings_path())),
+            {"hooks": {"SessionStart": [{"matcher": "startup", "hooks": []}]}},
+        )
 
     def test_hook_uninstall_drops_empty_hooks_key(self):
         self.init_project()

@@ -30,6 +30,22 @@ flagged, so a STATE.md that 1.2.0 accepted may need a small fix.
     to its target; they used to replace the link with a
     regular file, so the linked file silently stopped updating.
 
+- Bucket spacing fix: `add`, `move`, and `supersede` used to insert
+  after the blank line that separates a bucket from the next
+  heading, so consecutive items were split by blank lines, and each
+  `archive` or `move` left its blank line behind. Repeated cycles
+  piled up empty lines. New items now join the end of the bucket's
+  item list, and removing an item collapses the doubled blank line
+  it leaves. Existing stray blank lines are left as they are.
+- A file saved without a final newline no longer gets an inserted
+  line glued onto its last line. Archiving into a STATE-ARCHIVE.md
+  without a final newline used to merge the item into the
+  `## Archived` heading, which broke every later write. Moving the
+  last item of such a STATE.md now ends the moved line properly.
+- `pointer --install` and `--uninstall` act on the project root when
+  run from a subfolder, like `hook` and the other commands, instead
+  of creating an AGENTS.md in the subfolder. `hook --uninstall` no
+  longer deletes SessionStart groups the user had left empty.
 - New `hook` command for Claude Code. `hook --install` adds a
   SessionStart hook to `.claude/settings.json` (in the project
   root) that runs `show` and `check` at every session start. It

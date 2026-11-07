@@ -2102,13 +2102,16 @@ def uninstall_pointer(directory):
 
 
 def cmd_pointer(args):
+    # Like the other commands, act on the project root when run from
+    # a subfolder, not on a new AGENTS.md in the subfolder.
+    directory = find_project_root() or os.getcwd()
     if getattr(args, "install", False):
-        message = install_pointer(os.getcwd())
+        message = install_pointer(directory)
         if message:
             print(message)
         return 0
     if getattr(args, "uninstall", False):
-        messages = uninstall_pointer(os.getcwd())
+        messages = uninstall_pointer(directory)
         for message in messages:
             print(message)
         if not messages:
@@ -2199,12 +2202,16 @@ def cmd_hook(args):
         if not found:
             print("no StateCat SessionStart hook in %s" % HOOK_SETTINGS)
             return 0
+        emptied = []
         for group, hook in found:
             group["hooks"].remove(hook)
+            if not group["hooks"]:
+                emptied.append(group)
         hooks = settings["hooks"]
+        # Drop only groups this uninstall emptied, never ones the user left empty.
         hooks["SessionStart"] = [
             group for group in hooks["SessionStart"]
-            if not (isinstance(group, dict) and group.get("hooks") == [])
+            if not any(group is empty for empty in emptied)
         ]
         if not hooks["SessionStart"]:
             del hooks["SessionStart"]
@@ -2336,11 +2343,21 @@ def item_block_lines(state, item):
     return [list(pair) for pair in state.lines[item.line_index:end]]
 
 
+def terminate_line_before(state, index, ending):
+    """Give the line before index a line ending if it has none (the
+    last line of a file saved without a final newline), so an
+    inserted line cannot be glued onto it."""
+    if index > 0 and not state.lines[index - 1][1]:
+        state.lines[index - 1][1] = ending
+
+
 def insert_block_before_heading(state, index, block_lines):
     """Insert a whole item block, leaving a blank line before a heading."""
     ending = state.dominant_ending()
+    terminate_line_before(state, index, ending)
     for offset, pair in enumerate(block_lines):
-        state.lines.insert(index + offset, list(pair))
+        # A block taken from the end of a file may have no newline.
+        state.lines.insert(index + offset, [pair[0], pair[1] or ending])
     after = index + len(block_lines)
     if after < len(state.lines) and state.lines[after][0].startswith("## "):
         if state.lines[after - 1][0] != "":
@@ -2355,6 +2372,7 @@ def insert_line_before_heading(state, index, line_content):
     reformatted, re-wrapped, or reordered.
     """
     ending = state.dominant_ending()
+    terminate_line_before(state, index, ending)
     state.lines.insert(index, [line_content, ending])
     if index + 1 < len(state.lines) and state.lines[index + 1][0].startswith("## "):
         if state.lines[index][0] != "":
@@ -2362,13 +2380,43 @@ def insert_line_before_heading(state, index, line_content):
     return index
 
 
+def bucket_insert_index(state, start, end):
+    """Where a new item goes in the section [start, end): right after
+    its last non-blank line, so it joins the item list instead of
+    landing after the blank line that separates the section from the
+    next heading. In an empty section it goes after the heading's
+    blank line, if there is one."""
+    index = end
+    while index - 1 > start and state.lines[index - 1][0].strip() == "":
+        index -= 1
+    if index == start + 1 and index < end and state.lines[index][0].strip() == "":
+        index += 1
+    return index
+
+
+def delete_item_block(state, item):
+    """Delete an item and its continuations. When that leaves two
+    blank lines next to each other where the item was, drop one, so
+    repeated add/remove cycles do not pile up blank lines. No other
+    line is touched."""
+    index = item.line_index
+    del state.lines[index:index + 1 + len(item.continuation_indices)]
+    if (
+        0 < index < len(state.lines)
+        and state.lines[index - 1][0].strip() == ""
+        and state.lines[index][0].strip() == ""
+    ):
+        del state.lines[index]
+
+
 def insert_into_bucket(state, bucket, line_content):
-    """Insert a line into a bucket section, just before the next heading."""
+    """Insert a line at the end of a bucket's item list."""
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    insert_line_before_heading(state, end, line_content)
-    return end
+    index = bucket_insert_index(state, start, end)
+    insert_line_before_heading(state, index, line_content)
+    return index
 
 
 def cmd_add(args):
@@ -2424,12 +2472,12 @@ def _move_impl(directory, state, archive, item, bucket):
     new_item.starred = False
     rendered = new_item.render()
     block[0] = [rendered, block[0][1]]
-    del state.lines[old_index:old_index + len(block)]
+    delete_item_block(state, item)
     # Find the target bucket in the shortened file.
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    insert_block_before_heading(state, end, block)
+    insert_block_before_heading(state, bucket_insert_index(state, start, end), block)
     atomic_write(os.path.join(directory, STATE), state.lines)
 
 
@@ -2496,7 +2544,7 @@ def append_to_archive(archive, line_content, ending):
             "archive file has no '## Archived' heading; "
             "refusing to create a headerless archive entry"
         )
-    insert_line_before_heading(archive, end, line_content)
+    insert_line_before_heading(archive, bucket_insert_index(archive, start, end), line_content)
 
 
 def append_block_to_archive(archive, block_lines):
@@ -2507,7 +2555,7 @@ def append_block_to_archive(archive, block_lines):
             "archive file has no '## Archived' heading; "
             "refusing to create a headerless archive entry"
         )
-    insert_block_before_heading(archive, end, block_lines)
+    insert_block_before_heading(archive, bucket_insert_index(archive, start, end), block_lines)
 
 
 def cmd_supersede(args):
@@ -2544,7 +2592,7 @@ def cmd_supersede(args):
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
     state.set_last_id(new_id)
-    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    delete_item_block(state, item)
     new_line = "- #%d [%s] %s" % (new_id, today_str(), new_text)
     insert_into_bucket(state, "Decided", new_line)
     atomic_write(os.path.join(directory, STATE), state.lines)
@@ -2598,7 +2646,7 @@ def cmd_compact(args):
     for item in sorted(candidates, key=lambda candidate: candidate.line_index, reverse=True):
         block = item_block_lines(state, item)
         append_block_to_archive(archive, block)
-        del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+        delete_item_block(state, item)
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     atomic_write(os.path.join(directory, STATE), state.lines)
     for item in sorted(candidates, key=lambda candidate: candidate.item_id):
@@ -2626,7 +2674,7 @@ def cmd_archive(args):
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     state, _archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    delete_item_block(state, item)
     atomic_write(os.path.join(directory, STATE), state.lines)
     print("archived #%d" % item_id)
     return 0
