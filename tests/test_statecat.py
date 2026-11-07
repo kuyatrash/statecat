@@ -384,6 +384,21 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "init", "Again")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_init_rejects_multiline_project_name(self):
+        result = run_cli(
+            self.dir, "init", "My Project\n## Open\n- #999 [2026-11-06] Injected"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("control characters", result.stderr)
+        self.assertFalse(os.path.exists(state_path(self.dir)))
+        self.assertFalse(os.path.exists(archive_path(self.dir)))
+
+    def test_init_rejects_carriage_return_and_control_chars(self):
+        for bad in ("Bad\rName", "Bad\x01Name", "Bad\x7fName"):
+            result = run_cli(self.dir, "init", bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertFalse(os.path.exists(state_path(self.dir)))
+
     # 19. show a single bucket
     def test_show_single_bucket(self):
         self.copy_fixture()
@@ -624,6 +639,102 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "check")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("orphan indented line", result.stdout)
+
+    def test_invalid_calendar_date_warns(self):
+        # SC-03: the date shape is valid but the calendar date
+        # is not (month 99). It must warn instead of silently
+        # treating the item as unknown age.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        text = read_text(state_path(self.dir))
+        text = text.replace("[%s]" % TODAY, "[2026-99-99]", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("invalid date [2026-99-99]", result.stdout)
+
+    def test_fenced_code_block_is_not_structure(self):
+        # A heading and list line inside ``` fences are an
+        # example, not a bucket or an item: they must not be
+        # parsed, and check must stay clean.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Real item")
+        text = read_text(state_path(self.dir))
+        fence = (
+            "```markdown\n## Open\n- #99 [2026-11-06] Fake item\n```\n\n"
+        )
+        text = text.replace("## Decided\n", fence + "## Decided\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("clean", result.stdout)
+        result = run_cli(self.dir, "show", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("#99", result.stdout)
+        self.assertIn("Real item", result.stdout)
+
+    def test_stray_item_outside_bucket_is_structural(self):
+        # SC-06: an item placed before any bucket heading is
+        # invisible to show and ID allocation; check must flag
+        # it instead of silently ignoring it.
+        self.init_project()
+        text = read_text(state_path(self.dir))
+        text = text.replace(
+            "> Last ID used: #0\n",
+            "> Last ID used: #0\n- #6 [2026-11-06] Stray item\n",
+            1,
+        )
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside any bucket", result.stdout)
+        result = run_cli(self.dir, "show", "--json")
+        self.assertNotIn("Stray item", result.stdout)
+
+    def test_duplicate_bucket_heading_is_structural(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Plain item")
+        text = read_text(state_path(self.dir))
+        text = text.replace("## Waiting on human\n", "## Open\n\n## Waiting on human\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate bucket heading", result.stdout)
+
+    def test_duplicate_last_id_is_structural(self):
+        self.init_project()
+        text = read_text(state_path(self.dir))
+        text = text.replace(
+            "> Last ID used: #0\n",
+            "> Last ID used: #0\n> Last ID used: #0\n",
+            1,
+        )
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate 'Last ID used'", result.stdout)
+
+    def test_overlong_id_does_not_crash(self):
+        # SC-07: an ID longer than the parser's cap must not
+        # raise (Python 3.11+ caps int-string conversion); it
+        # is treated as an item without an ID instead.
+        self.init_project()
+        text = read_text(state_path(self.dir))
+        huge = "9" * 5000
+        text = text.replace(
+            "## Open\n", "## Open\n- #%s [2026-11-06] Huge ID\n" % huge, 1
+        )
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("has no ID", result.stdout)
 
     def test_drifted_id_counter_warns_and_fix_raises(self):
         self.init_project()
@@ -990,27 +1101,51 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no ID", result.stdout)
         self.assertIn("warning: line 6 in STATE-ARCHIVE.md has no date", result.stdout)
 
-    # v1.1.1: state files are written world-readable (0644), not 0600.
+    # New state files follow the umask (0666 & ~umask), not a
+    # forced mode: with the usual 022 umask that is 0644.
     # Unix permission bits do not exist on Windows (st_mode is
-    # fabricated as 0666 for a writable file), so these two tests
+    # fabricated as 0666 for a writable file), so these tests
     # only run where the mode they assert can exist.
     @unittest.skipIf(
         sys.platform == "win32",
         "Unix file mode bits do not exist on Windows",
     )
     def test_state_files_are_world_readable(self):
-        self.init_project()
-        for path in (state_path(self.dir), archive_path(self.dir)):
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
-        run_cli(self.dir, "add", "Open", "Written by add")
-        for path in (state_path(self.dir), archive_path(self.dir)):
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+        # Pin the umask for the CLI subprocesses (they inherit
+        # it), so the umask-derived mode is deterministic.
+        old_umask = os.umask(0o022)
+        try:
+            self.init_project()
+            for path in (state_path(self.dir), archive_path(self.dir)):
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+            run_cli(self.dir, "add", "Open", "Written by add")
+            for path in (state_path(self.dir), archive_path(self.dir)):
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+        finally:
+            os.umask(old_umask)
 
     @unittest.skipIf(
         sys.platform == "win32",
         "Unix file mode bits do not exist on Windows",
     )
-    def test_restore_leaves_files_world_readable(self):
+    def test_write_preserves_restrictive_permissions(self):
+        self.init_project()
+        os.chmod(state_path(self.dir), 0o600)
+        run_cli(self.dir, "add", "Open", "Confidential detail")
+        self.assertEqual(os.stat(state_path(self.dir)).st_mode & 0o777, 0o600)
+        # The pre-write snapshot of the restrictive file is
+        # restrictive too, not world-readable.
+        backup_root = os.path.join(self.dir, ".statecat", "backups")
+        names = sorted(os.listdir(backup_root))
+        self.assertTrue(names, "expected a pre-write snapshot")
+        newest = os.path.join(backup_root, names[-1], "STATE.md")
+        self.assertEqual(os.stat(newest).st_mode & 0o777, 0o600)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Unix file mode bits do not exist on Windows",
+    )
+    def test_restore_preserves_permissions(self):
         self.init_project()
         run_cli(self.dir, "add", "Open", "Before restore")
         os.chmod(state_path(self.dir), 0o600)
@@ -1018,7 +1153,7 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "restore")
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in (state_path(self.dir), archive_path(self.dir)):
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
 
@@ -1055,6 +1190,86 @@ class StateCatTest(unittest.TestCase):
             self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
             # The current owner releasing normally does delete it.
             second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_lock_pid_reuse_with_wrong_start_time_is_broken_as_stale(self):
+        # SC-04: a PID alone cannot identify the owner. If the
+        # owner dies and the OS hands its PID to an unrelated
+        # process, a plain liveness probe reports the reused
+        # PID as alive forever and the lock strands. The owner
+        # file also records the process start time; a live PID
+        # with the wrong start time proves the PID was reused,
+        # so the lock is broken as stale.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            # Rewrite the owner file: the PID is this live test
+            # process, but the start time is wrong, as if the
+            # PID had been reused after the owner died.
+            owner_path = os.path.join(lock_path, "owner")
+            text = re.sub(
+                r"^start=.*$", "start=1.0", read_text(owner_path), flags=re.M
+            )
+            with open(owner_path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            second = statecat.project_lock(self.dir)
+            second.__enter__()
+            self.assertNotEqual(second.owner_token, first.owner_token)
+            self.assertTrue(os.path.isdir(lock_path))
+            first.__exit__(None, None, None)
+            self.assertTrue(os.path.isdir(lock_path))
+            self.assertIn(second.owner_token, read_text(owner_path))
+            second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_lock_live_owner_with_matching_start_time_is_not_broken(self):
+        # The start-time check must not break a genuinely live
+        # owner: the same PID and the same start time means
+        # the owner is still the original process.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        env = {"STATECAT_LOCK_TIMEOUT": "1", "STATECAT_LOCK_STALE": "1"}
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            second = statecat.project_lock(self.dir)
+            with self.assertRaises(SystemExit):
+                second.__enter__()
+            self.assertTrue(os.path.isdir(lock_path))
+            owner_path = os.path.join(lock_path, "owner")
+            self.assertIn(first.owner_token, read_text(owner_path))
+            first.__exit__(None, None, None)
             self.assertFalse(os.path.isdir(lock_path))
         finally:
             for key, value in old_env.items():

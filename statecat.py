@@ -149,7 +149,33 @@ def parse_id(text):
         text = text[1:]
     if not text.isdigit():
         return None
-    return int(text)
+    return _bounded_id(text)
+
+
+# Item IDs are small counters, never huge numbers: cap the digit
+# length so an over-long ID cannot crash the parser (Python
+# 3.11+ caps int-string conversion, commonly at 4,300 digits).
+MAX_ID_DIGITS = 10
+
+
+def _bounded_id(digits):
+    """int(digits) when the digit string is within the ID length
+    cap, else None."""
+    if len(digits) > MAX_ID_DIGITS:
+        return None
+    return int(digits)
+
+
+def _valid_date(text):
+    """True when text is a real calendar date, not just
+    YYYY-MM-DD shaped. fromisoformat rejects impossible
+    months and days (e.g. 2026-99-99) that the shape regex
+    accepts."""
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
 
 
 def split_ending(line):
@@ -171,6 +197,7 @@ class Item:
         self.bucket = bucket  # bucket name, or "Archived" in the archive file
         self.item_id = None
         self.item_date = None
+        self.date_invalid = False
         self.starred = False
         self.text = ""
         self.continuation_indices = []
@@ -183,19 +210,27 @@ class Item:
         rest = body[2:]
         m = re.match(r"#(\d+) \[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
         if m:
-            self.item_id = int(m.group(1))
+            self.item_id = _bounded_id(m.group(1))
+            if self.item_id is None:
+                self.text = rest
+                return
             self.item_date = m.group(2)
+            self.date_invalid = not _valid_date(self.item_date)
             self.starred = bool(m.group(3))
             self.text = m.group(4)
             return
         m = re.match(r"#(\d+) (.*)$", rest)
         if m:
-            self.item_id = int(m.group(1))
+            self.item_id = _bounded_id(m.group(1))
+            if self.item_id is None:
+                self.text = rest
+                return
             self.text = m.group(2)
             return
         m = re.match(r"\[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
         if m:
             self.item_date = m.group(1)
+            self.date_invalid = not _valid_date(self.item_date)
             self.starred = bool(m.group(2))
             self.text = m.group(3)
             return
@@ -225,6 +260,9 @@ class StateFile:
         self.last_id_index = None
         self.unknown_headings = []  # list of (line_index, heading)
         self.orphan_lines = []  # list of (line_index, content)
+        self.stray_items = []  # list of (line_index, content): item-like lines outside any bucket
+        self.duplicate_headings = []  # list of (line_index, heading)
+        self.duplicate_last_id = []  # list of line_index: extra "> Last ID used:" lines
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -245,8 +283,22 @@ class StateFile:
     def _parse(self):
         bucket = None
         last_item = None
+        in_fence = False
+        seen_headings = set()
         for index, (content, _ending) in enumerate(self.lines):
+            # Fenced code blocks are not structure: a heading or
+            # list line inside ``` fences is an example, not a
+            # bucket or an item. Toggle on fence lines and skip
+            # everything inside, including the fences themselves.
+            if content.lstrip().startswith("```"):
+                in_fence = not in_fence
+                last_item = None
+                continue
+            if in_fence:
+                continue
             if content.startswith("> Last ID used:"):
+                if self.last_id is not None:
+                    self.duplicate_last_id.append(index)
                 value = parse_id(content.split(":", 1)[1])
                 if value is not None:
                     self.last_id = value
@@ -256,18 +308,32 @@ class StateFile:
                 heading = content[3:].strip()
                 if self.path.endswith(ARCHIVE):
                     # Archive file: any section holds archived items.
+                    if heading in seen_headings:
+                        self.duplicate_headings.append((index, heading))
+                    seen_headings.add(heading)
                     bucket = "Archived"
                 elif heading in BUCKETS:
+                    if heading in seen_headings:
+                        self.duplicate_headings.append((index, heading))
+                    seen_headings.add(heading)
                     bucket = heading
                 else:
                     bucket = None
                     self.unknown_headings.append((index, heading))
                 last_item = None
                 continue
-            if content.startswith("- ") and bucket is not None:
-                item = Item(index, content, self.lines[index][1], bucket)
-                self.items.append(item)
-                last_item = item
+            if content.startswith("- "):
+                if bucket is not None:
+                    item = Item(index, content, self.lines[index][1], bucket)
+                    self.items.append(item)
+                    last_item = item
+                else:
+                    # An item-like line outside any bucket is
+                    # invisible to show, ID allocation, and
+                    # duplicate detection, so it must be
+                    # flagged instead of silently ignored.
+                    self.stray_items.append((index, content))
+                    last_item = None
                 continue
             if content.startswith((" ", "\t")) and bucket is not None:
                 # An indented line immediately after an item (or after
@@ -342,11 +408,19 @@ class StateFile:
         """Return (start_index, end_index) for a bucket section.
 
         start_index is the heading line; end_index is the next heading
-        line, or the end of the file.
+        line, or the end of the file. Headings inside fenced code
+        blocks are examples, not structure, so they are skipped
+        here just as in _parse.
         """
         start = None
         end = len(self.lines)
+        in_fence = False
         for index, (content, _ending) in enumerate(self.lines):
+            if content.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
             if content == "## " + bucket:
                 start = index
             elif start is not None and content.startswith("## "):
@@ -384,6 +458,24 @@ def structural_problems(state, archive):
             "join it to the item above or remove the indent"
             % (index + 1, STATE)
         )
+    for index, _content in state.stray_items:
+        problems.append(
+            "item-like line %d in %s is outside any bucket; "
+            "move it under a bucket heading or delete it"
+            % (index + 1, STATE)
+        )
+    for index, heading in state.duplicate_headings:
+        problems.append(
+            "duplicate bucket heading '## %s' on line %d of %s; "
+            "keep one and move its items under it"
+            % (heading, index + 1, STATE)
+        )
+    for index in state.duplicate_last_id:
+        problems.append(
+            "duplicate 'Last ID used' on line %d of %s; "
+            "remove the extra line"
+            % (index + 1, STATE)
+        )
     if not os.path.exists(archive.path):
         problems.append(
             "missing file '%s'; restore a snapshot containing it, "
@@ -397,6 +489,24 @@ def structural_problems(state, archive):
         problems.append(
             "orphan indented line %d in %s is not part of an item; "
             "join it to the item above or remove the indent"
+            % (index + 1, ARCHIVE)
+        )
+    for index, _content in archive.stray_items:
+        problems.append(
+            "item-like line %d in %s is outside any bucket; "
+            "move it under a bucket heading or delete it"
+            % (index + 1, ARCHIVE)
+        )
+    for index, heading in archive.duplicate_headings:
+        problems.append(
+            "duplicate bucket heading '## %s' on line %d of %s; "
+            "keep one and move its items under it"
+            % (heading, index + 1, ARCHIVE)
+        )
+    for index in archive.duplicate_last_id:
+        problems.append(
+            "duplicate 'Last ID used' on line %d of %s; "
+            "remove the extra line"
             % (index + 1, ARCHIVE)
         )
     # Duplicate IDs: within a file, or across both files.
@@ -470,6 +580,16 @@ def warnings_for(state, archive, directory=None):
                 "warning: line %d in %s (%s) has no ID"
                 % (item.line_index + 1, STATE, item.bucket)
             )
+        if item.date_invalid:
+            warnings.append(
+                "warning: #%s in %s has an invalid date [%s]; "
+                "it is not a real calendar date, so its age is unknown"
+                % (
+                    item.item_id if item.item_id is not None else "?",
+                    STATE,
+                    item.item_date,
+                )
+            )
         if item.item_date is None:
             warnings.append(
                 "warning: line %d in %s (%s) has no date"
@@ -486,6 +606,16 @@ def warnings_for(state, archive, directory=None):
             warnings.append(
                 "warning: line %d in %s has no ID"
                 % (item.line_index + 1, ARCHIVE)
+            )
+        if item.date_invalid:
+            warnings.append(
+                "warning: #%s in %s has an invalid date [%s]; "
+                "it is not a real calendar date, so its age is unknown"
+                % (
+                    item.item_id if item.item_id is not None else "?",
+                    ARCHIVE,
+                    item.item_date,
+                )
             )
         if item.item_date is None:
             warnings.append(
@@ -533,20 +663,54 @@ def fail_cleanly(message):
     sys.exit(1)
 
 
+def _current_umask():
+    """Current process umask, read without changing it.
+
+    Linux: /proc/self/status reports it race-free. Anything
+    else falls back to the os.umask round-trip (set it to its
+    own value, which is atomic enough here: the heartbeat
+    thread never touches the umask)."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("Umask:"):
+                    return int(line.split(":", 1)[1].strip(), 8)
+    except (OSError, ValueError):
+        pass
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _mode_for_write(path):
+    """Permission bits for a file being (re)written at path.
+
+    An existing target keeps its own bits (a 0600 state file
+    stays 0600 through a rewrite, so a confidential file is
+    never silently made world-readable). A new file gets the
+    mode the umask allows (0666 & ~umask), never a forced
+    0644. Only the rwx bits are preserved or set; setuid,
+    setgid and sticky bits are never carried over."""
+    try:
+        return os.stat(path).st_mode & 0o777
+    except OSError:
+        return 0o666 & ~_current_umask()
+
+
 def atomic_write(path, lines):
     """Write lines ([content, ending] pairs) atomically: temp, then rename.
 
-    The temp file from mkstemp is mode 0600; chmod it to 0644
-    before the rename, so the state files stay readable by any
-    user or agent account on the machine, which is the point of
-    keeping state in plain Markdown."""
+    The replacement keeps the target's existing permission bits
+    when the target exists, and takes the umask's mode for a
+    new file, so a restrictive file is never silently opened
+    up by a rewrite."""
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="") as out:
             for content, ending in lines:
                 out.write(content + ending)
-        os.chmod(tmp_path, 0o644)
+        os.chmod(tmp_path, _mode_for_write(path))
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -557,14 +721,15 @@ def atomic_write(path, lines):
 
 
 def atomic_write_bytes(path, data):
-    """Write bytes atomically: temp, then rename. See atomic_write
-    for why the temp file is chmodded to 0644 first."""
+    """Write bytes atomically: temp, then rename. Same permission
+    policy as atomic_write: keep the target's bits, umask for
+    a new file."""
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
         with os.fdopen(handle, "wb") as out:
             out.write(data)
-        os.chmod(tmp_path, 0o644)
+        os.chmod(tmp_path, _mode_for_write(path))
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -611,6 +776,42 @@ def _pid_is_alive(pid):
     return True
 
 
+def _process_start_time(pid):
+    """Start time of a process as epoch seconds, or None if unknown.
+
+    Linux only, via /proc: starttime is field 22 of
+    /proc/<pid>/stat (clock ticks since boot); boot time is
+    btime in /proc/stat. A PID alone cannot identify a
+    process: after the owner dies, the OS may hand its PID to
+    an unrelated process, and a liveness probe then reports
+    the reused PID as alive forever. The start time tells
+    the original owner from the reuse. Returns None on any
+    failure, and on platforms without /proc (including
+    Windows, where liveness is unknown anyway)."""
+    if sys.platform == "win32":
+        return None
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as handle:
+            stat = handle.read()
+        # comm is in parens and may contain spaces or parens;
+        # the fields after the last ')' start at field 3.
+        rparen = stat.rfind(")")
+        fields = stat[rparen + 2:].split()
+        # fields[0] is state (field 3); starttime is field 22.
+        start_ticks = int(fields[19])
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+        with open("/proc/stat", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    boot = int(line.split()[1])
+                    break
+            else:
+                return None
+        return boot + start_ticks / ticks_per_second
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 # A lock whose owner cannot be determined -- no owner file yet,
 # an unreadable owner file, or a liveness check that returns
 # indeterminate -- is never abandoned in the normal stale
@@ -634,7 +835,10 @@ class project_lock:
     the lock is held from before the first read until after the last
     write, so two writers can no longer both read the same Last ID
     used, assign the same next ID, and silently lose one item.
-    Read-only commands do not take the lock.
+    Read-only commands that report on both state files take the
+    lock too, so a reader can never observe the half-finished
+    pair left between the two writes of a supersede, archive,
+    or compact.
 
     Ownership: acquiring the lock writes a random owner token
     (PID + uuid) into the lock's owner file. Release and stale
@@ -687,18 +891,20 @@ class project_lock:
     could still be replaced on POSIX. A crash in that same
     window leaves the same kind of leftover, never a deleted
     live lock. A PID recorded in the owner file can be reused
-    by an unrelated process after the owner dies, and that
-    strands the lock: the liveness check reports the reused
-    PID as alive, so the lock is treated as belonging to a
-    live writer until that unrelated process exits, however
-    stale the directory looks. The heartbeat does not fix
-    this -- the original owner's heartbeat thread died with
-    it, and the unrelated process never touches the lock's
-    mtime. This is a conservative failure (a stranded lock,
-    never a deleted live one), but it is not harmless: a lock
-    in this state blocks writers until the PID is freed, and
-    there is no start-time check to tell the reused PID from
-    the original owner. The second threshold for unknown
+    by an unrelated process after the owner dies, but the
+    owner file also records the owner's process start time,
+    and the staleness check compares it with the start time
+    of the process now holding that PID: a mismatch proves
+    the PID was reused and the owner is dead, so the lock is
+    broken instead of stranded. The start time comes from
+    /proc, so this only works on Linux; where it is
+    unavailable (including Windows, where liveness is always
+    unknown) the check falls back to the PID-only probe, and
+    a reused PID there still strands the lock until that
+    unrelated process exits. The heartbeat does not fix
+    that fallback case -- the original owner's heartbeat
+    thread died with it, and the unrelated process never
+    touches the lock's mtime. The second threshold for unknown
     ownership is likewise not a proof: a writer suspended
     for longer than ten times the stale limit between mkdir
     and its owner write could still lose its lock, and the
@@ -733,6 +939,48 @@ class project_lock:
             pass
         return None
 
+    def _read_owner_start_from(self, directory):
+        """Owner process start time (epoch seconds) from a lock
+        dir's owner file, or None when it is missing, "unknown",
+        or unparsable."""
+        try:
+            with open(os.path.join(directory, "owner"), "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("start="):
+                        value = line.split("=", 1)[1].strip()
+                        if value == "unknown":
+                            return None
+                        return float(value)
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
+    def _owner_is_alive(self, directory):
+        """True if the lock owner is a live process, False if
+        proved dead, None if liveness is unknown.
+
+        A PID alone is not proof: after the owner dies, the OS
+        may reuse its PID for an unrelated process, and a plain
+        liveness probe then reports the reused PID as alive
+        forever. When the owner file records a start time and
+        the process now holding that PID started at a different
+        time, the PID was reused and the owner is dead. When
+        either start time is unavailable, this falls back to
+        the PID-only probe (the old behaviour)."""
+        pid = self._read_owner_pid_from(directory)
+        if pid is None:
+            return None
+        alive = _pid_is_alive(pid)
+        if alive is not True:
+            return alive
+        recorded = self._read_owner_start_from(directory)
+        if recorded is None:
+            return True
+        current = _process_start_time(pid)
+        if current is None:
+            return True
+        return current == recorded
+
     def _is_abandoned_dir(self, directory, stale):
         """True only when abandonment is proved, never on unknown ownership.
 
@@ -753,12 +1001,7 @@ class project_lock:
         """
         if not self._is_stale_dir(directory, stale):
             return False
-        pid = self._read_owner_pid_from(directory)
-        if pid is None:
-            return self._is_stale_dir(
-                directory, stale * UNKNOWN_OWNER_STALE_MULTIPLIER
-            )
-        alive = _pid_is_alive(pid)
+        alive = self._owner_is_alive(directory)
         if alive is True:
             return False
         if alive is None:
@@ -860,7 +1103,7 @@ class project_lock:
         if pid is None:
             alive = None
         else:
-            alive = _pid_is_alive(pid)
+            alive = self._owner_is_alive(self.lock_path)
         if alive is True:
             opening = (
                 "another statecat process is writing in this project; "
@@ -1182,6 +1425,8 @@ class project_lock:
         try:
             with open(os.path.join(self.lock_path, "owner"), "x", encoding="utf-8") as handle:
                 handle.write("pid=%d time=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
+                start = _process_start_time(os.getpid())
+                handle.write("start=%s\n" % (repr(start) if start is not None else "unknown"))
                 handle.write("token=%s\n" % self.owner_token)
         except FileExistsError:
             return False
@@ -1532,8 +1777,16 @@ def take_snapshot(directory, kind):
     for filename in (STATE, ARCHIVE):
         source = os.path.join(directory, filename)
         if os.path.exists(source):
-            with open(source, "rb") as src, open(os.path.join(path, filename), "wb") as dst:
+            dest = os.path.join(path, filename)
+            with open(source, "rb") as src, open(dest, "wb") as dst:
                 shutil.copyfileobj(src, dst)
+            # A backup of a restrictive file stays restrictive:
+            # copy the source's permission bits instead of
+            # leaving the umask default on the copy.
+            try:
+                os.chmod(dest, os.stat(source).st_mode & 0o777)
+            except OSError:
+                pass
     prune_snapshots(directory)
     return name
 
@@ -1593,6 +1846,24 @@ def reject_newlines(text, label="item text"):
     if text is not None and ("\n" in text or "\r" in text):
         sys.stderr.write(
             "error: %s must be a single line; newlines are not allowed.\n" % label
+        )
+        sys.stderr.write("No files were changed and no backup was taken.\n")
+        sys.exit(1)
+
+
+def reject_control_chars(text, label="project name"):
+    """Reject \r, \n, and other control characters in text that
+    is interpolated into Markdown. A newline in a project name
+    would become real file structure (headings, fake items), so
+    it is refused here instead of written. Control characters
+    are any code point below 0x20 or 0x7f (DEL)."""
+    if text is not None and any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text
+    ):
+        sys.stderr.write(
+            "error: %s must be a single line without control "
+            "characters (no newlines, carriage returns, or "
+            "other control codes).\n" % label
         )
         sys.stderr.write("No files were changed and no backup was taken.\n")
         sys.exit(1)
@@ -1722,6 +1993,10 @@ def cmd_init(args):
         sys.stderr.write("error: %s or %s already exists; refusing to overwrite.\n" % (STATE, ARCHIVE))
         return 1
     project = args.project or os.path.basename(os.path.abspath(directory)) or "My Project"
+    # A newline or control character in the project name would
+    # be interpolated into STATE.md as real file structure, so
+    # it is refused before anything is written.
+    reject_control_chars(project, "project name")
     os.makedirs(backup_root(directory), exist_ok=True)
     atomic_write(state_path, lines_from_contents(template_state(project)))
     atomic_write(archive_path, lines_from_contents(template_archive(project)))
@@ -2256,10 +2531,11 @@ def snapshot_is_complete(target_path, target_name):
 
 def atomic_write_pair(directory, data_by_filename):
     """Write both state files as a pair: stage both temp files
-    first (0644, like atomic_write_bytes), then rename both
-    back-to-back. That cannot make two renames truly atomic, but
-    no file I/O happens between them, so the window in which a
-    crash could leave a mixed pair is just the two renames."""
+    first, then rename both back-to-back. That cannot make two
+    renames truly atomic, but no file I/O happens between them,
+    so the window in which a crash could leave a mixed pair is
+    just the two renames. Each file keeps its own target's
+    permission bits (umask for a new file), like atomic_write."""
     staged = []
     try:
         for filename, data in data_by_filename:
@@ -2268,7 +2544,7 @@ def atomic_write_pair(directory, data_by_filename):
             handle, tmp_path = tempfile.mkstemp(dir=tmp_dir, prefix=".statecat-tmp-")
             with os.fdopen(handle, "wb") as out:
                 out.write(data)
-            os.chmod(tmp_path, 0o644)
+            os.chmod(tmp_path, _mode_for_write(target))
             staged.append((tmp_path, target))
         for tmp_path, target in staged:
             os.replace(tmp_path, target)
@@ -2492,7 +2768,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # Write commands run whole read-modify-write cycles under the
     # project lock, so two writers cannot silently lose an item.
-    # Read-only commands do not take the lock.
+    # Read-only commands that report on both state files (show,
+    # status, search, check, diff) take the lock too: a
+    # supersede / archive / compact writes STATE-ARCHIVE.md
+    # first and STATE.md second, and a reader in between would
+    # otherwise see the same ID in both files. The lock is
+    # exclusive, so a reader may wait briefly for a writer to
+    # finish (up to the lock timeout); that is the price of
+    # never reporting an inconsistent pair. Commands that read
+    # neither state file (pointer, config show, restore --list)
+    # stay unlocked.
     # init and config set are writers too, and used to bypass the
     # lock: two agents init-ing the same empty directory could
     # interleave and leave STATE.md and STATE-ARCHIVE.md with
@@ -2504,7 +2789,10 @@ def main(argv=None):
     # depend on the state files existing. The second init still
     # fails cleanly inside the lock, once the first has created
     # the files, instead of overwriting them.
-    if args.command in ("add", "move", "update", "supersede", "archive", "compact"):
+    if args.command in (
+        "add", "move", "update", "supersede", "archive", "compact",
+        "show", "status", "search", "check", "diff",
+    ):
         directory = require_root()
         with project_lock(directory):
             return args.func(args)
@@ -2512,10 +2800,6 @@ def main(argv=None):
         with project_lock(os.getcwd()):
             return args.func(args)
     if args.command == "config" and getattr(args, "action", None) == "set":
-        directory = require_root()
-        with project_lock(directory):
-            return args.func(args)
-    if args.command == "check" and (getattr(args, "fix", False) or getattr(args, "fix_ids", False)):
         directory = require_root()
         with project_lock(directory):
             return args.func(args)
