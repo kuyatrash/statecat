@@ -1249,6 +1249,13 @@ class StateCatTest(unittest.TestCase):
         # The start-time check must not break a genuinely live
         # owner: the same PID and the same start time means
         # the owner is still the original process.
+        # The lock is aged 5s: past the 1s stale limit, so the
+        # abandonment check runs, but younger than the 10x
+        # unknown-owner threshold (10s), so on Windows, where
+        # liveness is unknown and the start time is
+        # unavailable, the lock is not abandoned as unknown
+        # either. On Linux the matching start time is what
+        # saves it; on Windows the 10x threshold is.
         self.init_project()
         sys.path.insert(0, ROOT)
         import statecat
@@ -1261,7 +1268,7 @@ class StateCatTest(unittest.TestCase):
             first = statecat.project_lock(self.dir)
             first.__enter__()
             first._stop_heartbeat()
-            old = time.time() - 3600
+            old = time.time() - 5
             os.utime(lock_path, (old, old))
             second = statecat.project_lock(self.dir)
             with self.assertRaises(SystemExit):
