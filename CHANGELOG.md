@@ -5,6 +5,28 @@
 Follow-up fixes after the v1.2.0 release (not yet pushed; the
 workflow change needs a push from a real git client, as before).
 
+- Break-test round. Each of these used to crash with a raw
+  traceback or misbehave, and each now has a regression test:
+  - IDs accept ASCII digits only. `move ² Open`, or a
+    hand-edited `> Last ID used: #²`, used to crash every
+    command, because `str.isdigit()` accepts `²` but `int()`
+    does not. Item lines with non-ASCII digits are no longer
+    read as IDs.
+  - A `STATE.md` that exists but cannot be read (for example
+    a folder with that name) fails cleanly instead of with a
+    traceback.
+  - A file sitting where `.statecat/` or `.statecat/backups/`
+    must be fails cleanly instead of with `FileExistsError`.
+  - `update` and `supersede` reject empty or blank text, like
+    `add` always did.
+  - `compact --older-than` rejects negative days; `-5` used to
+    archive every Decided item, including today's.
+  - Moving an item to the bucket it is already in changes
+    nothing; it used to rewrite the file and re-stamp the date.
+  - Writes follow a symlinked `STATE.md` or `STATE-ARCHIVE.md`
+    to its target; they used to replace the link with a
+    regular file, so the linked file silently stopped updating.
+
 - `init` and `config set` now run under the project lock, like
   the other writers: two agents init-ing the same empty
   directory can no longer interleave and leave mismatched

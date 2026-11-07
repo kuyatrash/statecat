@@ -2319,6 +2319,105 @@ class StateCatTest(unittest.TestCase):
 
 
 
+    # Break-test round: hostile input must fail cleanly, never crash.
+    def assert_clean_failure(self, result):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("error:", result.stderr)
+
+    def test_non_ascii_digit_id_is_rejected_cleanly(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "one")
+        result = run_cli(self.dir, "move", "\u00b2", "Open")
+        self.assert_clean_failure(result)
+        self.assertIn("bad item id", result.stderr)
+
+    def test_non_ascii_digit_last_id_does_not_crash(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "one")
+        path = state_path(self.dir)
+        text = re.sub(r"> Last ID used: #\d+", "> Last ID used: #\u00b2", read_text(path))
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        for command in (("show",), ("check",), ("status",)):
+            result = run_cli(self.dir, *command)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_state_file_that_is_a_folder_fails_cleanly(self):
+        self.init_project()
+        os.remove(state_path(self.dir))
+        os.mkdir(state_path(self.dir))
+        for command in (("show",), ("check",), ("add", "Open", "x")):
+            result = run_cli(self.dir, *command)
+            self.assert_clean_failure(result)
+            self.assertIn("cannot read 'STATE.md'", result.stderr)
+
+    def test_update_and_supersede_reject_empty_text(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "one")
+        run_cli(self.dir, "add", "Decided", "two")
+        before = read_bytes(state_path(self.dir))
+        for args in (("update", "1", ""), ("update", "1", "   "),
+                     ("supersede", "2", ""), ("supersede", "2", "  ")):
+            result = run_cli(self.dir, *args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn("must not be empty", result.stderr)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
+
+    def test_compact_rejects_negative_days(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "keep me")
+        before = read_bytes(state_path(self.dir))
+        for extra in ((), ("--dry-run",)):
+            result = run_cli(self.dir, "compact", "--older-than", "-5", *extra)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--older-than must be 0 or more", result.stderr)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
+
+    def test_move_to_same_bucket_changes_nothing(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "one")
+        path = state_path(self.dir)
+        text = re.sub(r"#1 \[[0-9-]+\]", "#1 [2020-01-01]", read_text(path))
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        before = read_bytes(path)
+        result = run_cli(self.dir, "move", "1", "Open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already in Open", result.stdout)
+        self.assertEqual(read_bytes(path), before)
+
+    @unittest.skipIf(sys.platform == "win32", "symlinks need extra privileges on Windows")
+    def test_symlinked_state_file_is_written_through(self):
+        self.init_project()
+        real = os.path.join(self.dir, "real-state.md")
+        os.rename(state_path(self.dir), real)
+        os.symlink("real-state.md", state_path(self.dir))
+        result = run_cli(self.dir, "add", "Open", "via link")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.islink(state_path(self.dir)))
+        self.assertIn("via link", read_text(real))
+
+    def test_file_in_place_of_statecat_folder_fails_cleanly(self):
+        self.init_project()
+        shutil.rmtree(os.path.join(self.dir, ".statecat"))
+        with open(os.path.join(self.dir, ".statecat"), "w") as handle:
+            handle.write("")
+        result = run_cli(self.dir, "add", "Open", "x")
+        self.assert_clean_failure(result)
+        self.assertIn("must be a folder", result.stderr)
+
+    def test_file_in_place_of_backups_folder_fails_cleanly(self):
+        self.init_project()
+        backups = os.path.join(self.dir, ".statecat", "backups")
+        shutil.rmtree(backups)
+        with open(backups, "w") as handle:
+            handle.write("")
+        result = run_cli(self.dir, "add", "Open", "x")
+        self.assert_clean_failure(result)
+        self.assertIn("must be a folder", result.stderr)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(StateCatTest)

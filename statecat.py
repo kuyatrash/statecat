@@ -147,7 +147,9 @@ def parse_id(text):
     text = text.strip()
     if text.startswith("#"):
         text = text[1:]
-    if not text.isdigit():
+    # ASCII digits only: str.isdigit() also accepts characters
+    # like '²' that int() rejects, which used to crash the CLI.
+    if not (text.isascii() and text.isdigit()):
         return None
     return _bounded_id(text)
 
@@ -208,7 +210,7 @@ class Item:
         if not body.startswith("- "):
             return
         rest = body[2:]
-        m = re.match(r"#(\d+) \[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
+        m = re.match(r"#([0-9]+) \[([0-9]{4}-[0-9]{2}-[0-9]{2})(\*)?\] ?(.*)$", rest)
         if m:
             self.item_id = _bounded_id(m.group(1))
             if self.item_id is None:
@@ -219,7 +221,7 @@ class Item:
             self.starred = bool(m.group(3))
             self.text = m.group(4)
             return
-        m = re.match(r"#(\d+) (.*)$", rest)
+        m = re.match(r"#([0-9]+) (.*)$", rest)
         if m:
             self.item_id = _bounded_id(m.group(1))
             if self.item_id is None:
@@ -227,7 +229,7 @@ class Item:
                 return
             self.text = m.group(2)
             return
-        m = re.match(r"\[(\d{4}-\d{2}-\d{2})(\*)?\] ?(.*)$", rest)
+        m = re.match(r"\[([0-9]{4}-[0-9]{2}-[0-9]{2})(\*)?\] ?(.*)$", rest)
         if m:
             self.item_date = m.group(1)
             self.date_invalid = not _valid_date(self.item_date)
@@ -275,6 +277,14 @@ class StateFile:
                 fail_cleanly(
                     "'%s' is not valid UTF-8; fix or remove the bad "
                     "bytes, or run statecat restore" % os.path.basename(path)
+                )
+            except OSError as exc:
+                # A path that exists but cannot be read (a folder
+                # named STATE.md, no read permission) must fail
+                # cleanly too, never with a raw traceback.
+                fail_cleanly(
+                    "cannot read '%s' (%s); it must be a readable file"
+                    % (os.path.basename(path), exc.strerror or exc)
                 )
             for content, ending in (split_ending(line) for line in raw):
                 self.lines.append([content, ending])
@@ -657,6 +667,19 @@ def warnings_for(state, archive, directory=None):
     return warnings
 
 
+def ensure_dir(path):
+    """os.makedirs(path, exist_ok=True), but a file sitting where a
+    folder must be (.statecat, .statecat/backups) fails cleanly
+    with no write, never with a raw FileExistsError."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except (FileExistsError, NotADirectoryError):
+        fail_cleanly(
+            "'%s' must be a folder, but a file is in the way; "
+            "move or delete that file and try again" % path
+        )
+
+
 def fail_cleanly(message):
     sys.stderr.write("error: %s\n" % message)
     sys.stderr.write("No files were changed. Fix the problem line or run statecat restore.\n")
@@ -697,6 +720,16 @@ def _mode_for_write(path):
         return 0o666 & ~_current_umask()
 
 
+def _write_target(path):
+    """The real file to replace. A symlinked STATE.md is written
+    through to its target; replacing the link itself would turn
+    it into a regular file and silently stop updating the file it
+    pointed to."""
+    if os.path.islink(path):
+        return os.path.realpath(path)
+    return path
+
+
 def atomic_write(path, lines):
     """Write lines ([content, ending] pairs) atomically: temp, then rename.
 
@@ -704,6 +737,7 @@ def atomic_write(path, lines):
     when the target exists, and takes the umask's mode for a
     new file, so a restrictive file is never silently opened
     up by a rewrite."""
+    path = _write_target(path)
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
@@ -724,6 +758,7 @@ def atomic_write_bytes(path, data):
     """Write bytes atomically: temp, then rename. Same permission
     policy as atomic_write: keep the target's bits, umask for
     a new file."""
+    path = _write_target(path)
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
     try:
@@ -1342,7 +1377,7 @@ class project_lock:
         # (for tests) override .statecat/config, which overrides defaults.
         config = load_config(self.directory)
         timeout, stale = self._resolve_lock_timing(config)
-        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        ensure_dir(os.path.dirname(self.lock_path))
         self._cleanup_orphaned_lock_dirs(stale)
         deadline = time.monotonic() + timeout
         while True:
@@ -1379,7 +1414,7 @@ class project_lock:
                 time.sleep(LOCK_POLL_SECONDS)
                 continue
             except FileNotFoundError:
-                os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+                ensure_dir(os.path.dirname(self.lock_path))
                 continue
             # mkdir succeeded: write the owner file exclusively.
             # If we lost the race in the window between mkdir
@@ -1660,7 +1695,7 @@ def load_config(directory):
 
 
 def save_config(directory, config):
-    os.makedirs(os.path.dirname(config_path(directory)), exist_ok=True)
+    ensure_dir(os.path.dirname(config_path(directory)))
     atomic_write(config_path(directory), [[json.dumps(config, indent=2), "\n"]])
 
 
@@ -1769,7 +1804,7 @@ def take_snapshot(directory, kind):
     from datetime import datetime
 
     root = backup_root(directory)
-    os.makedirs(root, exist_ok=True)
+    ensure_dir(root)
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
     name = ("safety-" + stamp) if kind == "safety" else stamp
     path = os.path.join(root, name)
@@ -1997,7 +2032,7 @@ def cmd_init(args):
     # be interpolated into STATE.md as real file structure, so
     # it is refused before anything is written.
     reject_control_chars(project, "project name")
-    os.makedirs(backup_root(directory), exist_ok=True)
+    ensure_dir(backup_root(directory))
     atomic_write(state_path, lines_from_contents(template_state(project)))
     atomic_write(archive_path, lines_from_contents(template_archive(project)))
     print("created %s" % STATE)
@@ -2252,6 +2287,9 @@ def cmd_move_real(args):
     if item.bucket == "Parked" and not args.owner_approved:
         sys.stderr.write("error: #%d is Parked; moving out of Parked requires --owner-approved.\n" % item_id)
         return 1
+    if item.bucket == bucket:
+        print("#%d is already in %s; nothing changed" % (item_id, bucket))
+        return 0
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
@@ -2271,6 +2309,9 @@ def cmd_update(args):
     item = find_item_or_fail(state, item_id)
     if item.bucket == "Parked" and not args.owner_approved:
         sys.stderr.write("error: #%d is Parked; updating a parked item requires --owner-approved.\n" % item_id)
+        return 1
+    if args.text is None or not args.text.strip():
+        sys.stderr.write("error: item text must not be empty\n")
         return 1
     reject_newlines(args.text, "item text")
     take_snapshot(directory, "pre-write")
@@ -2319,6 +2360,9 @@ def cmd_supersede(args):
     if item.bucket != "Decided":
         sys.stderr.write("error: supersede only applies to Decided items; #%d is in %s\n" % (item_id, item.bucket))
         return 1
+    if args.text is None or not args.text.strip():
+        sys.stderr.write("error: item text must not be empty\n")
+        return 1
     reject_newlines(args.text, "item text")
     if args.because:
         reject_newlines(args.because, "because text")
@@ -2366,6 +2410,9 @@ def compact_candidates(state, days):
 
 
 def cmd_compact(args):
+    if args.older_than < 0:
+        sys.stderr.write("error: --older-than must be 0 or more days (got %d)\n" % args.older_than)
+        return 1
     directory = require_root()
     state, archive = read_state_and_archive(directory)
     problems = structural_problems(state, archive)
@@ -2539,7 +2586,7 @@ def atomic_write_pair(directory, data_by_filename):
     staged = []
     try:
         for filename, data in data_by_filename:
-            target = os.path.join(directory, filename)
+            target = _write_target(os.path.join(directory, filename))
             tmp_dir = os.path.dirname(target) or "."
             handle, tmp_path = tempfile.mkstemp(dir=tmp_dir, prefix=".statecat-tmp-")
             with os.fdopen(handle, "wb") as out:
