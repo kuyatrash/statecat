@@ -2045,6 +2045,9 @@ def cmd_init(args):
         message = ensure_gitignore(directory)
         if message:
             print(message)
+    if getattr(args, "hook", False):
+        code, message = install_hook(directory)
+        (sys.stderr if code else sys.stdout).write(message + "\n")
     return 0
 
 
@@ -2055,6 +2058,107 @@ def cmd_pointer(args):
             print(message)
         return 0
     print(POINTER_LINE)
+    return 0
+
+
+CLAUDE_SETTINGS = os.path.join(".claude", "settings.json")
+HOOK_PREAMBLE = (
+    "StateCat: this project keeps its living state in STATE.md, printed "
+    "below with the check result. Read it before asking about or working "
+    "on this project: do not re-ask Decided items or raise Parked ones. "
+    "Record new decisions and open work with statecat add."
+)
+
+
+def hook_command(directory):
+    """The SessionStart command for this project: the local script
+    when statecat.py sits in the project root, else the pip-installed
+    statecat command."""
+    if os.path.isfile(os.path.join(directory, "statecat.py")):
+        return 'python3 "$CLAUDE_PROJECT_DIR/statecat.py" hook --run'
+    return "statecat hook --run"
+
+
+def hook_settings(directory):
+    return {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": hook_command(directory)}]}
+            ]
+        }
+    }
+
+
+def _is_statecat_hook(command):
+    return isinstance(command, str) and "statecat" in command and "hook --run" in command
+
+
+def install_hook(directory):
+    """Merge the SessionStart hook into .claude/settings.json, keeping
+    every other setting. Returns (exit code, message)."""
+    path = os.path.join(directory, CLAUDE_SETTINGS)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                text = handle.read()
+            data = json.loads(text) if text.strip() else {}
+        except (OSError, ValueError) as exc:
+            return 1, "error: could not read %s: %s; left it unchanged." % (CLAUDE_SETTINGS, exc)
+        if not isinstance(data, dict):
+            return 1, "error: %s is not a JSON object; left it unchanged." % CLAUDE_SETTINGS
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        return 1, 'error: "hooks" in %s is not an object; left it unchanged.' % CLAUDE_SETTINGS
+    session_start = hooks.setdefault("SessionStart", [])
+    if not isinstance(session_start, list):
+        return 1, 'error: "hooks.SessionStart" in %s is not a list; left it unchanged.' % CLAUDE_SETTINGS
+    for group in session_start:
+        for entry in (group.get("hooks") or []) if isinstance(group, dict) else []:
+            if isinstance(entry, dict) and _is_statecat_hook(entry.get("command")):
+                return 0, "hook already in %s" % CLAUDE_SETTINGS
+    session_start.append(
+        {"hooks": [{"type": "command", "command": hook_command(directory)}]}
+    )
+    try:
+        ensure_dir(os.path.dirname(path))
+        atomic_write_bytes(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+    except OSError as exc:
+        return 1, "error: could not write %s: %s" % (CLAUDE_SETTINGS, exc)
+    return 0, "added SessionStart hook to %s" % CLAUDE_SETTINGS
+
+
+def run_hook():
+    """What the SessionStart hook prints into the agent's context.
+    It never fails the session: no STATE.md prints nothing, and a
+    held lock or broken file still exits 0."""
+    directory = find_project_root()
+    if directory is None:
+        return 0
+    print(HOOK_PREAMBLE)
+    print()
+    sys.stdout.flush()
+    try:
+        with project_lock(directory):
+            cmd_show(argparse.Namespace(bucket=None, json=False))
+            print()
+            cmd_check(argparse.Namespace(fix=False, fix_ids=False))
+    except SystemExit:
+        print("StateCat could not read the state right now; run statecat check.")
+    except Exception as exc:  # never break session start
+        print("StateCat could not read the state: %s; run statecat check." % exc)
+    return 0
+
+
+def cmd_hook(args):
+    if getattr(args, "run", False):
+        return run_hook()
+    directory = find_project_root() or os.getcwd()
+    if getattr(args, "install", False):
+        code, message = install_hook(directory)
+        (sys.stderr if code else sys.stdout).write(message + "\n")
+        return code
+    print(json.dumps(hook_settings(directory), indent=2))
     return 0
 
 
@@ -2733,11 +2837,21 @@ def build_parser():
     p.add_argument("project", nargs="?", help="Project name for the About header")
     p.add_argument("--no-pointer", action="store_true", help="Do not install the read-first pointer line")
     p.add_argument("--no-gitignore", action="store_true", help="Do not add .statecat/ to .gitignore")
+    p.add_argument("--hook", action="store_true", help="Also add the Claude Code SessionStart hook to .claude/settings.json")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("pointer", help="Print the read-first pointer line, or install it with --install")
     p.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
     p.set_defaults(func=cmd_pointer)
+
+    p = sub.add_parser("hook", help="Print the Claude Code SessionStart hook, or install it with --install",
+                         description="Print the Claude Code SessionStart hook that puts STATE.md in front of "
+                                     "every new, resumed, cleared, or compacted session. --install merges it "
+                                     "into .claude/settings.json; --run is what the hook itself calls.")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--install", action="store_true", help="Add the hook to .claude/settings.json")
+    group.add_argument("--run", action="store_true", help="Print the state for the agent (used by the hook)")
+    p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("show", help="Print the full state, or one bucket")
     p.add_argument("bucket", nargs="?", help="Bucket name, e.g. Open")

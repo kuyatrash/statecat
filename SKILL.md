@@ -15,7 +15,11 @@ That pointer is the real read-first and session-start check mechanism.
 This skill is supporting detail, not the trigger, because skills are
 advisory and may not fire. `init` installs the line into AGENTS.md
 (or CLAUDE.md) for new projects; `pointer --install` adds it to an
-existing project, and `pointer` just prints it.
+existing project, and `pointer` just prints it. In Claude Code,
+`hook --install` (or `init --hook`) adds a SessionStart hook that
+prints STATE.md and the check result into every new, resumed,
+cleared, or compacted session, so the read happens without relying
+on the agent.
 
 ## Session workflow
 

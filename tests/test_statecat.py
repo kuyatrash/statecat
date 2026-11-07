@@ -892,6 +892,71 @@ class StateCatTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.")
 
+    # Claude Code SessionStart hook.
+    def settings_path(self):
+        return os.path.join(self.dir, ".claude", "settings.json")
+
+    def test_hook_prints_session_start_json(self):
+        result = run_cli(self.dir, "hook")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        command = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("hook --run", command)
+
+    def test_hook_install_merges_and_does_not_duplicate(self):
+        self.init_project()
+        os.makedirs(os.path.dirname(self.settings_path()))
+        with open(self.settings_path(), "w", encoding="utf-8") as handle:
+            json.dump({"model": "x", "hooks": {"Stop": []}}, handle)
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added SessionStart hook", result.stdout)
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertIn("hook already in", result.stdout)
+        data = json.loads(read_text(self.settings_path()))
+        self.assertEqual(data["model"], "x")
+        self.assertEqual(data["hooks"]["Stop"], [])
+        self.assertEqual(len(data["hooks"]["SessionStart"]), 1)
+
+    def test_hook_install_leaves_invalid_settings_unchanged(self):
+        os.makedirs(os.path.dirname(self.settings_path()))
+        with open(self.settings_path(), "w", encoding="utf-8") as handle:
+            handle.write("not json")
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("left it unchanged", result.stderr)
+        self.assertEqual(read_text(self.settings_path()), "not json")
+
+    def test_init_hook_flag_installs_hook(self):
+        result = run_cli(self.dir, "init", "Hook Project", "--hook")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added SessionStart hook", result.stdout)
+        self.assertTrue(os.path.isfile(self.settings_path()))
+
+    def test_hook_run_prints_state_and_check(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "Use hooks")
+        sub = os.path.join(self.dir, "sub")
+        os.makedirs(sub)
+        result = run_cli(sub, "hook", "--run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Read it before asking", result.stdout)
+        self.assertIn("Use hooks", result.stdout)
+        self.assertIn("check: clean", result.stdout)
+
+    def test_hook_run_without_state_is_silent_success(self):
+        result = run_cli(self.dir, "hook", "--run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_hook_run_with_structural_problem_still_exits_zero(self):
+        self.init_project()
+        with open(state_path(self.dir), "a", encoding="utf-8") as handle:
+            handle.write("## Open\n")
+        result = run_cli(self.dir, "hook", "--run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("problem:", result.stdout)
+
     # v1.1: show --json, status, search.
     def test_show_json_is_machine_readable(self):
         self.init_project("Json Project")

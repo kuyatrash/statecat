@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- `hook` prints a Claude Code SessionStart hook that puts STATE.md
+  and the `check` result into the agent's context at the start of
+  every session, including after resume, `/clear`, and compaction,
+  so agents no longer have to choose to follow the pointer.
+  `hook --install` merges it into `.claude/settings.json`, keeping
+  other settings and never adding it twice; `init --hook` does the
+  same for a new project. A settings file that is not valid JSON is
+  left unchanged. `hook --run` is what the hook calls: it always
+  exits 0, prints nothing without a STATE.md, and reports instead of
+  failing when the state cannot be read.
+
 ## 1.3.0 — 2026-11-06
 
 Hardening release after v1.2.0. Upgrading: run `check` once.

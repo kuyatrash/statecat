@@ -47,6 +47,28 @@ Read STATE.md first, then run python3 statecat.py check, before asking about or 
 
 That pointer, not the skill, is the real read-first mechanism.
 
+### Make it automatic in Claude Code
+
+A pointer is still a request, and agents can skip it. In Claude
+Code you can take the choice away: a SessionStart hook prints
+STATE.md and the `check` result straight into the agent's context
+at the start of every session, including after a resume, `/clear`,
+or compaction.
+
+```sh
+python3 statecat.py hook --install   # or: init "My Project" --hook
+```
+
+This merges one hook into `.claude/settings.json` and keeps every
+other setting; running it again changes nothing. `python3
+statecat.py hook` just prints the JSON so you can add it by hand.
+The hook never blocks a session: without a STATE.md it prints
+nothing, and if the state cannot be read it says so and moves on.
+
+Prefer to let Claude Code do the setup? Paste the prompt in
+[CLAUDE-CODE-SETUP.md](CLAUDE-CODE-SETUP.md) into a session in
+your project.
+
 ## Before and after
 
 Without StateCat, a fresh session asks: "What did we decide about
