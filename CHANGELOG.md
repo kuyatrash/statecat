@@ -1,5 +1,84 @@
 # Changelog
 
+## Unreleased
+
+- `init` with a blank project name uses the folder name, as when the
+  name is omitted, instead of writing an empty `# Project:` header;
+  surrounding spaces in a name are trimmed.
+- The SessionStart hook runs the installed `statecat` command when
+  there is no `statecat.py` in the project root, so it works for a
+  pip install too; it used to print nothing there. `hook --install`
+  upgrades an existing StateCat hook to this command.
+- `hook --install` says "could not read" when `.claude/settings.json`
+  cannot be opened (a folder in its place, no permission), instead
+  of wrongly calling the file invalid JSON.
+- The "no item #N" hint names an interpreter that runs on the
+  platform: `py statecat.py show` on Windows, where `python3` is
+  often a Microsoft Store stub, and `python3 statecat.py show`
+  elsewhere.
+- `search` matches words on an item's hand-wrapped continuation
+  lines, not just its first line, and prints the whole item.
+  Matching uses `casefold()`, so e.g. German `ß` matches `SS`.
+- `show --json` items gain a `continuation` list with their wrapped
+  lines (stripped), so JSON readers no longer lose that text. `text`
+  is unchanged, so existing readers keep working.
+- A bucket heading with trailing whitespace (`## Open  `, often left
+  by an editor) no longer blocks every write as a "missing bucket
+  heading": the parser already read it as the bucket, but the
+  section lookup used by writes and by check compared it exactly.
+- `check --fix` with nothing to fix no longer takes a snapshot. Each
+  no-op run used to add an identical snapshot, pushing real ones
+  out of `backups_kept` and making the no-op copy the default
+  `restore` target.
+- `config set` keeps keys it does not know (from a newer StateCat,
+  say) instead of dropping them from `.statecat/config`.
+- Output is always UTF-8. On Windows a piped stdout (an agent, the
+  SessionStart hook, `| cat`) defaults to the ANSI code page, so
+  `show`, `search`, and `diff` crashed with `UnicodeEncodeError` on
+  any item containing a character outside it, such as a check mark;
+  the hook then silently printed nothing.
+- `compact` archives items in their file order; it used to write
+  them to STATE-ARCHIVE.md in reverse.
+- `diff` reads snapshots BOM-tolerant, like the current files, so a
+  BOM alone is no longer reported as a changed first line (and no
+  longer crashed the Windows output).
+- `pointer --install` keeps a UTF-8 BOM when it upgrades the old
+  wording, and `pointer --uninstall` removes a pointer on a
+  BOM-prefixed first line and keeps the BOM.
+- Bucket spacing fix: `add`, `move`, and `supersede` used to insert
+  after the blank line that separates a bucket from the next
+  heading, so consecutive items were split by blank lines, and each
+  `archive` or `move` left its blank line behind. Repeated cycles
+  piled up empty lines. New items now join the end of the bucket's
+  item list, and removing an item collapses the doubled blank line
+  it leaves. Existing stray blank lines are left as they are.
+- A file saved without a final newline no longer gets an inserted
+  line glued onto its last line. Archiving into a STATE-ARCHIVE.md
+  without a final newline used to merge the item into the
+  `## Archived` heading, which broke every later write. Moving the
+  last item of such a STATE.md now ends the moved line properly.
+- `pointer --install` and `--uninstall` act on the project root when
+  run from a subfolder, like `hook` and the other commands, instead
+  of creating an AGENTS.md in the subfolder. `hook --uninstall` no
+  longer deletes SessionStart groups the user had left empty.
+- New `hook` command for Claude Code. `hook --install` adds a
+  SessionStart hook to `.claude/settings.json` (in the project
+  root) that runs `show` and `check` at every session start. It
+  keeps every existing setting, never adds the hook twice,
+  upgrades an older StateCat hook command in place, and refuses
+  with no write when the file is not valid JSON or `hooks` /
+  `hooks.SessionStart` has the wrong type. `hook --uninstall`
+  removes only the StateCat entry; `hook` alone prints it.
+- `python3` is no longer assumed. On Windows it is often a
+  Microsoft Store stub that runs nothing. The hook and the
+  `./statecat` launcher try `python3`, then `py`, then `python`,
+  and the pointer line now names `py statecat.py check` for
+  Windows. `pointer --install` upgrades the old pointer wording
+  in place instead of adding a second line.
+- New `pointer --uninstall` removes the pointer line (current or
+  older wording) from AGENTS.md and CLAUDE.md, and deletes an
+  AGENTS.md that `init` created if the pointer was all it held.
+
 ## 1.3.0 — 2026-11-06
 
 Hardening release after v1.2.0. Upgrading: run `check` once.

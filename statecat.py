@@ -431,7 +431,10 @@ class StateFile:
                 continue
             if in_fence:
                 continue
-            if content == "## " + bucket:
+            # Match the heading the way _parse reads it (stripped), so a
+            # trailing space an editor left on "## Open " does not make
+            # the bucket "missing" while the parser sees it fine.
+            if start is None and content.startswith("## ") and content[3:].strip() == bucket:
                 start = index
             elif start is not None and content.startswith("## "):
                 end = index
@@ -1743,6 +1746,16 @@ def cmd_config(args):
             )
             return 1
         config[key] = value
+        # Keep keys this version does not know (from a newer StateCat,
+        # say) instead of silently dropping them from the file.
+        try:
+            with open(config_path(directory), "r", encoding="utf-8-sig") as handle:
+                existing = json.load(handle)
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict):
+            existing.update(config)
+            config = existing
         save_config(directory, config)
         print("set %s = %s" % (key, value))
         return 0
@@ -1941,10 +1954,23 @@ def lines_from_contents(contents, ending="\n"):
 
 
 POINTER_LINE = (
-    "Read STATE.md first, then run python3 statecat.py check, "
+    "Read STATE.md first, then run python3 statecat.py check "
+    "(py statecat.py check on Windows if python3 is not found), "
     "before asking about or working on this project."
 )
+# Earlier pointer wordings, recognised so install upgrades them in
+# place instead of adding a second line, and uninstall removes them.
+LEGACY_POINTER_LINES = (
+    "Read STATE.md first, then run python3 statecat.py check, "
+    "before asking about or working on this project.",
+)
 POINTER_FILES = ("AGENTS.md", "CLAUDE.md")
+POINTER_CREATED_HEADER = "# Project instructions\n\n"
+
+
+def is_pointer_line(content):
+    stripped = content.strip()
+    return stripped == POINTER_LINE or stripped in LEGACY_POINTER_LINES
 
 
 def install_pointer(directory, create=True):
@@ -1964,19 +1990,29 @@ def install_pointer(directory, create=True):
         target = os.path.join(directory, "AGENTS.md")
         try:
             with open(target, "w", encoding="utf-8", newline="") as handle:
-                handle.write("# Project instructions\n\n%s\n" % POINTER_LINE)
+                handle.write("%s%s\n" % (POINTER_CREATED_HEADER, POINTER_LINE))
         except OSError as exc:
             sys.stderr.write("warning: could not create %s: %s\n" % (target, exc))
             return None
         return "created AGENTS.md with pointer"
     try:
-        with open(target, "r", encoding="utf-8-sig", newline="") as handle:
+        # Plain utf-8, not utf-8-sig: a BOM stays in content as
+        # U+FEFF, so the in-place upgrade below writes it back.
+        with open(target, "r", encoding="utf-8", newline="") as handle:
             content = handle.read()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         sys.stderr.write("warning: could not read %s: %s\n" % (target, exc))
         return None
     if POINTER_LINE in content:
         return "pointer already in %s" % os.path.basename(target)
+    for legacy in LEGACY_POINTER_LINES:
+        if legacy in content:
+            try:
+                atomic_write_bytes(target, content.replace(legacy, POINTER_LINE, 1).encode("utf-8"))
+            except OSError as exc:
+                sys.stderr.write("warning: could not update %s: %s\n" % (target, exc))
+                return None
+            return "updated pointer in %s" % os.path.basename(target)
     try:
         with open(target, "a", encoding="utf-8", newline="") as handle:
             if content and not content.endswith("\n"):
@@ -2027,7 +2063,9 @@ def cmd_init(args):
     if os.path.exists(state_path) or os.path.exists(archive_path):
         sys.stderr.write("error: %s or %s already exists; refusing to overwrite.\n" % (STATE, ARCHIVE))
         return 1
-    project = args.project or os.path.basename(os.path.abspath(directory)) or "My Project"
+    # A blank name falls back like an omitted one, instead of writing
+    # an empty "# Project:" header.
+    project = (args.project or "").strip() or os.path.basename(os.path.abspath(directory)) or "My Project"
     # A newline or control character in the project name would
     # be interpolated into STATE.md as real file structure, so
     # it is refused before anything is written.
@@ -2048,13 +2086,174 @@ def cmd_init(args):
     return 0
 
 
+def uninstall_pointer(directory):
+    """Remove every pointer line (current or legacy wording) from
+    AGENTS.md and CLAUDE.md. A file that is left holding only the
+    header init wrote when it created the file is deleted, since
+    init made it. Returns a list of short messages."""
+    messages = []
+    for name in POINTER_FILES:
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as handle:
+                lines = handle.readlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.stderr.write("warning: could not read %s: %s\n" % (path, exc))
+            continue
+        bom = ""
+        if lines and lines[0].startswith("﻿"):
+            bom, lines[0] = "﻿", lines[0][1:]
+        kept = [line for line in lines if not is_pointer_line(line)]
+        if len(kept) == len(lines):
+            continue
+        remaining = "".join(kept)
+        try:
+            if remaining.replace("\r\n", "\n") in (POINTER_CREATED_HEADER, POINTER_CREATED_HEADER.rstrip("\n") + "\n"):
+                os.unlink(path)
+                messages.append("removed %s (it held only the pointer)" % name)
+            else:
+                atomic_write_bytes(path, (bom + remaining).encode("utf-8"))
+                messages.append("removed pointer from %s" % name)
+        except OSError as exc:
+            sys.stderr.write("warning: could not update %s: %s\n" % (path, exc))
+    return messages
+
+
 def cmd_pointer(args):
+    # Like the other commands, act on the project root when run from
+    # a subfolder, not on a new AGENTS.md in the subfolder.
+    directory = find_project_root() or os.getcwd()
     if getattr(args, "install", False):
-        message = install_pointer(os.getcwd())
+        message = install_pointer(directory)
         if message:
             print(message)
         return 0
+    if getattr(args, "uninstall", False):
+        messages = uninstall_pointer(directory)
+        for message in messages:
+            print(message)
+        if not messages:
+            print("no pointer found in %s" % " or ".join(POINTER_FILES))
+        return 0
     print(POINTER_LINE)
+    return 0
+
+
+# Claude Code SessionStart hook. It runs in a POSIX shell (Git Bash on
+# Windows). It tries python3, then py, then python, because on Windows
+# python3 is often a Microsoft Store stub that runs nothing, and the
+# trailing exit 0 would otherwise hide that the hook did nothing.
+# When statecat.py is not in the project root (installed with pip),
+# it runs the installed statecat command instead.
+HOOK_COMMAND = (
+    'cd "$CLAUDE_PROJECT_DIR" && { if [ -f statecat.py ]; then '
+    "P=python3; $P -c '' 2>/dev/null || P=py; $P -c '' 2>/dev/null || P=python; "
+    'S="$P statecat.py"; else S=statecat; fi; '
+    "$S show && $S check; }; exit 0"
+)
+HOOK_SETTINGS = os.path.join(".claude", "settings.json")
+
+
+def hook_entry():
+    return {"hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+
+
+def is_statecat_hook(hook):
+    command = hook.get("command") if isinstance(hook, dict) else None
+    if not isinstance(command, str):
+        return False
+    if command == HOOK_COMMAND:
+        return True
+    # Older StateCat hook commands, recognised so install upgrades them.
+    return "statecat.py show" in command and "statecat.py check" in command
+
+
+def load_hook_settings(path):
+    """Return (settings, error). A missing file gives {}. Anything
+    that is not a JSON object with an object 'hooks' and a list
+    'SessionStart' is an error, so a file we cannot safely merge
+    into is never overwritten."""
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            settings = json.load(handle)
+    except OSError as exc:
+        return None, "could not read %s (%s); nothing was changed" % (path, exc)
+    except ValueError as exc:
+        return None, "%s is not valid JSON (%s); fix it by hand, nothing was changed" % (path, exc)
+    if not isinstance(settings, dict):
+        return None, "%s is not a JSON object; nothing was changed" % path
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return None, "'hooks' in %s is not an object; nothing was changed" % path
+    if not isinstance(hooks.get("SessionStart", []), list):
+        return None, "'hooks.SessionStart' in %s is not a list; nothing was changed" % path
+    return settings, None
+
+
+def write_hook_settings(path, settings):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    atomic_write_bytes(path, (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
+
+
+def cmd_hook(args):
+    if not (args.install or args.uninstall):
+        print(json.dumps({"hooks": {"SessionStart": [hook_entry()]}}, indent=2))
+        return 0
+    directory = find_project_root() or os.getcwd()
+    path = os.path.join(directory, HOOK_SETTINGS)
+    settings, error = load_hook_settings(path)
+    if error:
+        sys.stderr.write("error: %s\n" % error)
+        return 1
+    groups = settings.get("hooks", {}).get("SessionStart", [])
+    found = [
+        (group, hook)
+        for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        for hook in group["hooks"] if is_statecat_hook(hook)
+    ]
+    if args.install:
+        if any(hook.get("command") == HOOK_COMMAND for _group, hook in found):
+            print("SessionStart hook already in %s" % HOOK_SETTINGS)
+            return 0
+        if found:
+            # An older StateCat command: upgrade the first, drop the rest.
+            found[0][1]["command"] = HOOK_COMMAND
+            for group, hook in found[1:]:
+                group["hooks"].remove(hook)
+            message = "updated SessionStart hook in %s" % HOOK_SETTINGS
+        else:
+            settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(hook_entry())
+            message = "added SessionStart hook to %s" % HOOK_SETTINGS
+    else:
+        if not found:
+            print("no StateCat SessionStart hook in %s" % HOOK_SETTINGS)
+            return 0
+        emptied = []
+        for group, hook in found:
+            group["hooks"].remove(hook)
+            if not group["hooks"]:
+                emptied.append(group)
+        hooks = settings["hooks"]
+        # Drop only groups this uninstall emptied, never ones the user left empty.
+        hooks["SessionStart"] = [
+            group for group in hooks["SessionStart"]
+            if not any(group is empty for empty in emptied)
+        ]
+        if not hooks["SessionStart"]:
+            del hooks["SessionStart"]
+        if not hooks:
+            del settings["hooks"]
+        message = "removed SessionStart hook from %s" % HOOK_SETTINGS
+    try:
+        write_hook_settings(path, settings)
+    except OSError as exc:
+        sys.stderr.write("error: could not write %s: %s\n" % (path, exc))
+        return 1
+    print(message)
     return 0
 
 
@@ -2066,13 +2265,17 @@ def project_name(state):
     return None
 
 
-def item_to_dict(item):
-    return {
+def item_to_dict(item, parsed=None):
+    data = {
         "id": item.item_id,
         "date": item.item_date,
         "starred": item.starred,
         "text": item.text,
     }
+    if parsed is not None:
+        # Hand-wrapped lines, stripped, so JSON readers see the whole item.
+        data["continuation"] = [parsed.lines[index][0].strip() for index in item.continuation_indices]
+    return data
 
 
 def cmd_show(args):
@@ -2090,7 +2293,7 @@ def cmd_show(args):
             "project": project_name(state),
             "last_id": state.last_id,
             "buckets": {
-                bucket: [item_to_dict(item) for item in state.items if item.bucket == bucket]
+                bucket: [item_to_dict(item, state) for item in state.items if item.bucket == bucket]
                 for bucket in buckets
             },
         }
@@ -2144,27 +2347,34 @@ def cmd_status(args):
     return 0
 
 
+def item_full_text(parsed, item):
+    """An item's text with its hand-wrapped continuation lines joined
+    on, so search finds words that sit on a wrapped line."""
+    parts = [item.text] + [parsed.lines[index][0].strip() for index in item.continuation_indices]
+    return " ".join(part for part in parts if part)
+
+
 def cmd_search(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
-    needle = args.text.lower()
+    needle = args.text.casefold()
     found = []
     for item in state.items:
-        if needle in item.text.lower():
-            found.append((item.bucket, item))
+        if needle in item_full_text(state, item).casefold():
+            found.append((item.bucket, item, item_full_text(state, item)))
     if getattr(args, "archive", False):
         for item in archive.items:
-            if needle in item.text.lower():
-                found.append(("Archived", item))
+            if needle in item_full_text(archive, item).casefold():
+                found.append(("Archived", item, item_full_text(archive, item)))
     if not found:
         print("no matches for %r" % args.text)
         return 1
-    for bucket, item in found:
+    for bucket, item, text in found:
         item_id = "#%d" % item.item_id if item.item_id is not None else "#?"
         item_date = item.item_date or "no date"
         if item.starred:
             item_date += "*"
-        print("- %s [%s] (%s) %s" % (item_id, item_date, bucket, item.text))
+        print("- %s [%s] (%s) %s" % (item_id, item_date, bucket, text))
     return 0
 
 
@@ -2174,11 +2384,21 @@ def item_block_lines(state, item):
     return [list(pair) for pair in state.lines[item.line_index:end]]
 
 
+def terminate_line_before(state, index, ending):
+    """Give the line before index a line ending if it has none (the
+    last line of a file saved without a final newline), so an
+    inserted line cannot be glued onto it."""
+    if index > 0 and not state.lines[index - 1][1]:
+        state.lines[index - 1][1] = ending
+
+
 def insert_block_before_heading(state, index, block_lines):
     """Insert a whole item block, leaving a blank line before a heading."""
     ending = state.dominant_ending()
+    terminate_line_before(state, index, ending)
     for offset, pair in enumerate(block_lines):
-        state.lines.insert(index + offset, list(pair))
+        # A block taken from the end of a file may have no newline.
+        state.lines.insert(index + offset, [pair[0], pair[1] or ending])
     after = index + len(block_lines)
     if after < len(state.lines) and state.lines[after][0].startswith("## "):
         if state.lines[after - 1][0] != "":
@@ -2193,6 +2413,7 @@ def insert_line_before_heading(state, index, line_content):
     reformatted, re-wrapped, or reordered.
     """
     ending = state.dominant_ending()
+    terminate_line_before(state, index, ending)
     state.lines.insert(index, [line_content, ending])
     if index + 1 < len(state.lines) and state.lines[index + 1][0].startswith("## "):
         if state.lines[index][0] != "":
@@ -2200,13 +2421,43 @@ def insert_line_before_heading(state, index, line_content):
     return index
 
 
+def bucket_insert_index(state, start, end):
+    """Where a new item goes in the section [start, end): right after
+    its last non-blank line, so it joins the item list instead of
+    landing after the blank line that separates the section from the
+    next heading. In an empty section it goes after the heading's
+    blank line, if there is one."""
+    index = end
+    while index - 1 > start and state.lines[index - 1][0].strip() == "":
+        index -= 1
+    if index == start + 1 and index < end and state.lines[index][0].strip() == "":
+        index += 1
+    return index
+
+
+def delete_item_block(state, item):
+    """Delete an item and its continuations. When that leaves two
+    blank lines next to each other where the item was, drop one, so
+    repeated add/remove cycles do not pile up blank lines. No other
+    line is touched."""
+    index = item.line_index
+    del state.lines[index:index + 1 + len(item.continuation_indices)]
+    if (
+        0 < index < len(state.lines)
+        and state.lines[index - 1][0].strip() == ""
+        and state.lines[index][0].strip() == ""
+    ):
+        del state.lines[index]
+
+
 def insert_into_bucket(state, bucket, line_content):
-    """Insert a line into a bucket section, just before the next heading."""
+    """Insert a line at the end of a bucket's item list."""
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    insert_line_before_heading(state, end, line_content)
-    return end
+    index = bucket_insert_index(state, start, end)
+    insert_line_before_heading(state, index, line_content)
+    return index
 
 
 def cmd_add(args):
@@ -2240,8 +2491,8 @@ def find_item_or_fail(state, item_id):
     item = state.find(item_id)
     if item is None:
         sys.stderr.write(
-            "error: no item #%d in %s; run 'python3 statecat.py show' "
-            "to list items\n" % (item_id, STATE)
+            "error: no item #%d in %s; run '%s statecat.py show' "
+            "to list items\n" % (item_id, STATE, "py" if sys.platform == "win32" else "python3")
         )
         sys.exit(1)
     return item
@@ -2262,12 +2513,12 @@ def _move_impl(directory, state, archive, item, bucket):
     new_item.starred = False
     rendered = new_item.render()
     block[0] = [rendered, block[0][1]]
-    del state.lines[old_index:old_index + len(block)]
+    delete_item_block(state, item)
     # Find the target bucket in the shortened file.
     start, end = state.bucket_range(bucket)
     if start is None:
         fail_cleanly("bucket %r not found in %s" % (bucket, STATE))
-    insert_block_before_heading(state, end, block)
+    insert_block_before_heading(state, bucket_insert_index(state, start, end), block)
     atomic_write(os.path.join(directory, STATE), state.lines)
 
 
@@ -2334,7 +2585,7 @@ def append_to_archive(archive, line_content, ending):
             "archive file has no '## Archived' heading; "
             "refusing to create a headerless archive entry"
         )
-    insert_line_before_heading(archive, end, line_content)
+    insert_line_before_heading(archive, bucket_insert_index(archive, start, end), line_content)
 
 
 def append_block_to_archive(archive, block_lines):
@@ -2345,7 +2596,7 @@ def append_block_to_archive(archive, block_lines):
             "archive file has no '## Archived' heading; "
             "refusing to create a headerless archive entry"
         )
-    insert_block_before_heading(archive, end, block_lines)
+    insert_block_before_heading(archive, bucket_insert_index(archive, start, end), block_lines)
 
 
 def cmd_supersede(args):
@@ -2382,7 +2633,7 @@ def cmd_supersede(args):
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
     state.set_last_id(new_id)
-    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    delete_item_block(state, item)
     new_line = "- #%d [%s] %s" % (new_id, today_str(), new_text)
     insert_into_bucket(state, "Decided", new_line)
     atomic_write(os.path.join(directory, STATE), state.lines)
@@ -2432,11 +2683,13 @@ def cmd_compact(args):
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     candidates, _skipped = compact_candidates(state, args.older_than)
-    # Delete in reverse line order so earlier indices stay valid.
-    for item in sorted(candidates, key=lambda candidate: candidate.line_index, reverse=True):
-        block = item_block_lines(state, item)
-        append_block_to_archive(archive, block)
-        del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    # Archive in file order, so the archive keeps the items' order,
+    # then delete in reverse line order so earlier indices stay valid.
+    in_order = sorted(candidates, key=lambda candidate: candidate.line_index)
+    for item in in_order:
+        append_block_to_archive(archive, item_block_lines(state, item))
+    for item in reversed(in_order):
+        delete_item_block(state, item)
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     atomic_write(os.path.join(directory, STATE), state.lines)
     for item in sorted(candidates, key=lambda candidate: candidate.item_id):
@@ -2464,7 +2717,7 @@ def cmd_archive(args):
     atomic_write(os.path.join(directory, ARCHIVE), archive.lines)
     state, _archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    del state.lines[item.line_index:item.line_index + 1 + len(item.continuation_indices)]
+    delete_item_block(state, item)
     atomic_write(os.path.join(directory, STATE), state.lines)
     print("archived #%d" % item_id)
     return 0
@@ -2484,8 +2737,11 @@ def cmd_check(args):
             sys.stderr.write("error: structural problems must be fixed before --fix can run.\n")
             return 1
         # --fix is exempt from the Parked guard: it only adds IDs/dates.
-        take_snapshot(directory, "pre-write")
-        state, archive = read_state_and_archive(directory)
+        # Fix in memory first and snapshot only when there is something
+        # to write: a no-op --fix used to add an identical snapshot each
+        # run, pushing real ones out of backups_kept and making the
+        # no-op copy the default restore target. The lock is held, so
+        # the files on disk are still the ones read here.
         fixed = []
         today = today_str()
         for item in list(state.items):
@@ -2519,6 +2775,7 @@ def cmd_check(args):
             state.set_last_id(highest)
             counter_fixed = True
         if fixed or counter_fixed:
+            take_snapshot(directory, "pre-write")
             atomic_write(os.path.join(directory, STATE), state.lines)
             for fixed_id in fixed:
                 print("fixed #%d" % fixed_id)
@@ -2697,7 +2954,9 @@ def cmd_diff(args):
         if not os.path.exists(snapshot_file):
             continue
         try:
-            with open(snapshot_file, "r", encoding="utf-8", newline="") as handle:
+            # utf-8-sig, like StateFile reads the current files, so a
+            # BOM alone never shows up as a changed first line.
+            with open(snapshot_file, "r", encoding="utf-8-sig", newline="") as handle:
                 old = handle.readlines()
         except UnicodeDecodeError:
             fail_cleanly(
@@ -2735,9 +2994,17 @@ def build_parser():
     p.add_argument("--no-gitignore", action="store_true", help="Do not add .statecat/ to .gitignore")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("pointer", help="Print the read-first pointer line, or install it with --install")
-    p.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
+    p = sub.add_parser("pointer", help="Print the read-first pointer line, or install/uninstall it")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--install", action="store_true", help="Append the pointer line to AGENTS.md (or CLAUDE.md)")
+    group.add_argument("--uninstall", action="store_true", help="Remove the pointer line from AGENTS.md and CLAUDE.md")
     p.set_defaults(func=cmd_pointer)
+
+    p = sub.add_parser("hook", help="Print the Claude Code SessionStart hook, or install/uninstall it")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--install", action="store_true", help="Add the hook to .claude/settings.json, keeping other settings")
+    group.add_argument("--uninstall", action="store_true", help="Remove the StateCat hook from .claude/settings.json")
+    p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("show", help="Print the full state, or one bucket")
     p.add_argument("bucket", nargs="?", help="Bucket name, e.g. Open")
@@ -2810,7 +3077,22 @@ def build_parser():
     return parser
 
 
+def use_utf8_output():
+    """State files are UTF-8, so output is too. On Windows a piped
+    stdout (an agent, a hook, `| cat`) defaults to the ANSI code
+    page, and printing any item with a character outside it, such
+    as a check mark, crashed with UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if encoding != "utf8":
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (AttributeError, ValueError, OSError):
+                pass
+
+
 def main(argv=None):
+    use_utf8_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     # Write commands run whole read-modify-write cycles under the

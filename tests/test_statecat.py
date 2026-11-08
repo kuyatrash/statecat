@@ -23,6 +23,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(ROOT, "statecat.py")
 FIXTURE_DIR = os.path.join(ROOT, "fixture")
 TODAY = date.today().isoformat()
+POINTER = (
+    "Read STATE.md first, then run python3 statecat.py check "
+    "(py statecat.py check on Windows if python3 is not found), "
+    "before asking about or working on this project."
+)
+LEGACY_POINTER = (
+    "Read STATE.md first, then run python3 statecat.py check, "
+    "before asking about or working on this project."
+)
 
 
 def run_cli(cwd, *args):
@@ -890,7 +899,402 @@ class StateCatTest(unittest.TestCase):
     def test_pointer_prints_the_line(self):
         result = run_cli(self.dir, "pointer")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.")
+        self.assertEqual(result.stdout.strip(), POINTER)
+
+    def test_docs_quote_the_current_pointer(self):
+        for filename in ("README.md", "SKILL.md", "AGENTS-pointer.md"):
+            text = read_text(os.path.join(ROOT, filename))
+            self.assertIn(POINTER, text, filename)
+            self.assertNotIn(LEGACY_POINTER, text, filename)
+
+    def test_pointer_install_upgrades_legacy_line_in_place(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Rules\r\n\r\n%s\r\nKeep tests green.\r\n" % LEGACY_POINTER)
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("updated pointer in AGENTS.md", result.stdout)
+        self.assertEqual(
+            read_text(agents),
+            "# Rules\r\n\r\n%s\r\nKeep tests green.\r\n" % POINTER,
+        )
+
+    def test_pointer_uninstall_removes_line_and_keeps_the_rest(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        claude = os.path.join(self.dir, "CLAUDE.md")
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Rules\n%s\nKeep tests green.\n" % POINTER)
+        with open(claude, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Notes\n%s\n" % LEGACY_POINTER)
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed pointer from AGENTS.md", result.stdout)
+        self.assertIn("removed pointer from CLAUDE.md", result.stdout)
+        self.assertEqual(read_text(agents), "# Rules\nKeep tests green.\n")
+        self.assertEqual(read_text(claude), "# Notes\n")
+        again = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertIn("no pointer found", again.stdout)
+
+    def test_pointer_uninstall_deletes_agents_md_that_init_created(self):
+        self.init_project()
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed AGENTS.md", result.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+
+    def test_pointer_install_from_subfolder_uses_project_root(self):
+        self.init_project()
+        sub = os.path.join(self.dir, "src")
+        os.makedirs(sub)
+        self.assertIn("pointer already in AGENTS.md", run_cli(sub, "pointer", "--install").stdout)
+        self.assertFalse(os.path.exists(os.path.join(sub, "AGENTS.md")))
+        self.assertIn("removed AGENTS.md", run_cli(sub, "pointer", "--uninstall").stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "AGENTS.md")))
+
+    def test_pointer_upgrade_and_uninstall_keep_a_bom(self):
+        agents = os.path.join(self.dir, "AGENTS.md")
+        with open(agents, "wb") as handle:
+            handle.write(("﻿%s\n# Rules\n" % LEGACY_POINTER).encode("utf-8"))
+        self.assertIn("updated pointer", run_cli(self.dir, "pointer", "--install").stdout)
+        self.assertEqual(read_bytes(agents), ("﻿%s\n# Rules\n" % POINTER).encode("utf-8"))
+        self.assertIn("removed pointer from AGENTS.md", run_cli(self.dir, "pointer", "--uninstall").stdout)
+        self.assertEqual(read_bytes(agents), "﻿# Rules\n".encode("utf-8"))
+
+    def test_pointer_install_and_uninstall_are_exclusive(self):
+        result = run_cli(self.dir, "pointer", "--install", "--uninstall")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_non_ascii_output_survives_a_non_utf8_stdout(self):
+        # Windows pipes default to the ANSI code page; cp1252 forces that anywhere.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "ship it ✓")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        for args in (["show"], ["show", "Open"], ["search", "ship"], ["status"]):
+            result = subprocess.run([sys.executable, CLI, *args], cwd=self.dir, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, (args, result.stderr.decode("utf-8", "replace")))
+            if args[0] != "status":
+                self.assertIn("ship it ✓", result.stdout.decode("utf-8"), args)
+
+    def test_init_blank_name_falls_back_to_folder_name(self):
+        result = run_cli(self.dir, "init", "   ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = read_text(state_path(self.dir)).splitlines()[0]
+        self.assertEqual(first, "# Project: %s" % os.path.basename(os.path.abspath(self.dir)))
+        with tempfile.TemporaryDirectory() as padded:
+            self.assertEqual(run_cli(padded, "init", "  Named  ").returncode, 0)
+            self.assertEqual(read_text(state_path(padded)).splitlines()[0], "# Project: Named")
+
+    def test_search_finds_words_on_wrapped_continuation_lines(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace(
+            "## Open\n\n",
+            "## Open\n\n- #1 [%s] First line of a wrapped item\n    second line mentions Zebra\n" % TODAY,
+        ).replace("> Last ID used: #0", "> Last ID used: #1")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "search", "zebra")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("#1", result.stdout)
+        self.assertIn("second line mentions Zebra", result.stdout)
+        item = json.loads(run_cli(self.dir, "show", "--json").stdout)["buckets"]["Open"][0]
+        self.assertEqual(item["text"], "First line of a wrapped item")
+        self.assertEqual(item["continuation"], ["second line mentions Zebra"])
+        self.assertEqual(run_cli(self.dir, "archive", "1").returncode, 0)
+        self.assertNotEqual(run_cli(self.dir, "search", "zebra").returncode, 0)
+        self.assertIn("(Archived)", run_cli(self.dir, "search", "zebra", "--archive").stdout)
+
+    def test_heading_with_trailing_whitespace_still_works(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace("## Open\n", "## Open  \n").replace("## Parked\n", "##  Parked\t\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+        self.assertEqual(run_cli(self.dir, "add", "Open", "after the spaced heading").returncode, 0)
+        self.assertEqual(run_cli(self.dir, "add", "Parked", "parked one").returncode, 0)
+        after = read_text(path)
+        self.assertIn("## Open  \n\n- #1 [%s] after the spaced heading\n" % TODAY, after)
+        self.assertIn("##  Parked\t\n\n- #2 [%s] parked one\n" % TODAY, after)
+        self.assertIn("after the spaced heading", run_cli(self.dir, "show", "Open").stdout)
+
+    def test_config_set_keeps_unknown_keys(self):
+        self.init_project()
+        path = os.path.join(self.dir, ".statecat", "config")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"future_key": "keep me", "stale_days": 7}))
+        result = run_cli(self.dir, "config", "set", "backups_kept", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(read_text(path))
+        self.assertEqual(saved["future_key"], "keep me")
+        self.assertEqual(saved["stale_days"], 7)
+        self.assertEqual(saved["backups_kept"], 5)
+
+    def test_check_fix_with_nothing_to_fix_takes_no_snapshot(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "real change")
+        before = run_cli(self.dir, "restore", "--list").stdout
+        for _ in range(3):
+            result = run_cli(self.dir, "check", "--fix")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("nothing to fix", result.stdout)
+        self.assertEqual(run_cli(self.dir, "restore", "--list").stdout, before)
+
+    def test_compact_keeps_archive_in_item_order(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace(
+            "## Decided\n\n",
+            "## Decided\n\n- #1 [2020-01-01] one\n- #2 [2020-01-02] two\n- #3 [2020-01-03] three\n",
+        ).replace("> Last ID used: #0", "> Last ID used: #3")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        self.assertEqual(run_cli(self.dir, "compact", "--older-than", "30").returncode, 0)
+        archived = [line for line in read_text(archive_path(self.dir)).splitlines() if line.startswith("- #")]
+        self.assertEqual([line[:4] for line in archived], ["- #1", "- #2", "- #3"])
+        self.assertIn("## Decided\n\n## Open", read_text(path))
+
+    def test_diff_ignores_a_bom_on_the_snapshot(self):
+        self.init_project()
+        path = state_path(self.dir)
+        original = read_bytes(path)
+        with open(path, "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + original)
+        run_cli(self.dir, "add", "Open", "new item")
+        self.assertEqual(run_cli(self.dir, "restore").returncode, 0)
+        result = run_cli_env(self.dir, {"PYTHONIOENCODING": "utf-8"}, "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("﻿", result.stdout)
+        self.assertNotIn("-# Project", result.stdout)
+
+    # Bucket spacing: items stay together and blank lines never pile up.
+    def test_consecutive_adds_stay_together_without_blank_lines(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "first")
+        run_cli(self.dir, "add", "Open", "second")
+        run_cli(self.dir, "add", "Open", "third")
+        text = read_text(state_path(self.dir))
+        self.assertIn(
+            "## Open\n\n- #1 [%s] first\n- #2 [%s] second\n- #3 [%s] third\n\n## Waiting on human"
+            % (TODAY, TODAY, TODAY),
+            text,
+        )
+
+    def test_add_archive_cycles_do_not_accumulate_blank_lines(self):
+        self.init_project()
+        fresh = read_text(state_path(self.dir))
+        for _ in range(3):
+            run_cli(self.dir, "add", "Open", "temporary")
+            last = json.loads(run_cli(self.dir, "show", "--json").stdout)["last_id"]
+            self.assertEqual(run_cli(self.dir, "archive", str(last)).returncode, 0)
+        after = read_text(state_path(self.dir))
+        self.assertEqual(
+            re.sub(r"> Last ID used: #\d+", "", after),
+            re.sub(r"> Last ID used: #\d+", "", fresh),
+        )
+
+    def test_move_keeps_target_list_together_and_source_tidy(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "kept")
+        run_cli(self.dir, "add", "Open", "promoted")
+        self.assertEqual(run_cli(self.dir, "move", "2", "Decided").returncode, 0)
+        text = read_text(state_path(self.dir))
+        self.assertIn("## Decided\n\n- #1 [%s] kept\n- #2 [%s] promoted\n\n## Open\n\n## Waiting" % (TODAY, TODAY), text)
+
+    def test_archive_into_file_without_final_newline(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "to archive")
+        path = archive_path(self.dir)
+        trimmed = read_text(path).rstrip("\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(trimmed)
+        result = run_cli(self.dir, "archive", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = read_text(path).split("\n")
+        self.assertIn("## Archived", lines)
+        self.assertIn("- #1 [%s] to archive" % TODAY, lines)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+
+    def test_move_last_item_of_file_without_final_newline(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Parked", "last line")
+        path = state_path(self.dir)
+        trimmed = read_text(path).rstrip("\n")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(trimmed)
+        result = run_cli(self.dir, "move", "1", "Open", "--owner-approved")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = read_text(path)
+        self.assertIn("- #1 [%s] last line\n\n## Waiting on human" % TODAY, text)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+
+    # Claude Code SessionStart hook.
+    def settings_path(self):
+        return os.path.join(self.dir, ".claude", "settings.json")
+
+    def write_settings(self, text):
+        os.makedirs(os.path.dirname(self.settings_path()), exist_ok=True)
+        with open(self.settings_path(), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+
+    def statecat_hook_commands(self):
+        settings = json.loads(read_text(self.settings_path()))
+        return [
+            hook["command"]
+            for group in settings.get("hooks", {}).get("SessionStart", [])
+            for hook in group["hooks"]
+            if "statecat" in hook["command"] and "show" in hook["command"]
+        ]
+
+    def test_hook_install_creates_settings(self):
+        self.init_project()
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added SessionStart hook", result.stdout)
+        commands = self.statecat_hook_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertIn('cd "$CLAUDE_PROJECT_DIR"', commands[0])
+        self.assertIn("P=py", commands[0])
+        self.assertTrue(commands[0].endswith("exit 0"))
+
+    def test_hook_install_keeps_existing_settings_and_is_idempotent(self):
+        self.init_project()
+        other = {"type": "command", "command": "echo hello"}
+        self.write_settings(json.dumps({
+            "permissions": {"allow": ["Bash(ls)"]},
+            "hooks": {
+                "SessionStart": [{"hooks": [other]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}],
+            },
+        }))
+        self.assertEqual(run_cli(self.dir, "hook", "--install").returncode, 0)
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already in", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings["permissions"], {"allow": ["Bash(ls)"]})
+        self.assertIn("Stop", settings["hooks"])
+        self.assertEqual(settings["hooks"]["SessionStart"][0], {"hooks": [other]})
+        self.assertEqual(len(self.statecat_hook_commands()), 1)
+
+    def test_hook_install_upgrades_old_statecat_command(self):
+        self.init_project()
+        old = 'cd "$CLAUDE_PROJECT_DIR" && python3 statecat.py show && python3 statecat.py check; exit 0'
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": old}]},
+        ]}}))
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("updated SessionStart hook", result.stdout)
+        commands = self.statecat_hook_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertNotEqual(commands[0], old)
+
+    def test_hook_install_refuses_invalid_json(self):
+        self.init_project()
+        self.write_settings('{"hooks": {,}')
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not valid JSON", result.stderr)
+        self.assertEqual(read_text(self.settings_path()), '{"hooks": {,}')
+
+    def test_hook_install_reports_unreadable_settings_plainly(self):
+        self.init_project()
+        os.makedirs(self.settings_path())  # a folder where the file should be
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read", result.stderr)
+        self.assertNotIn("not valid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_hook_install_refuses_wrong_shapes(self):
+        self.init_project()
+        for text in ('[]', '{"hooks": []}', '{"hooks": {"SessionStart": {}}}'):
+            self.write_settings(text)
+            result = run_cli(self.dir, "hook", "--install")
+            self.assertNotEqual(result.returncode, 0, text)
+            self.assertEqual(read_text(self.settings_path()), text)
+
+    def test_hook_uninstall_removes_only_statecat_entry(self):
+        self.init_project()
+        other = {"type": "command", "command": "echo hello"}
+        self.write_settings(json.dumps({"model": "x", "hooks": {"SessionStart": [{"hooks": [other]}]}}))
+        run_cli(self.dir, "hook", "--install")
+        result = run_cli(self.dir, "hook", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed SessionStart hook", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings, {"model": "x", "hooks": {"SessionStart": [{"hooks": [other]}]}})
+
+    def test_hook_uninstall_keeps_groups_the_user_left_empty(self):
+        self.init_project()
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [{"matcher": "startup", "hooks": []}]}}))
+        run_cli(self.dir, "hook", "--install")
+        self.assertEqual(run_cli(self.dir, "hook", "--uninstall").returncode, 0)
+        self.assertEqual(
+            json.loads(read_text(self.settings_path())),
+            {"hooks": {"SessionStart": [{"matcher": "startup", "hooks": []}]}},
+        )
+
+    def test_hook_uninstall_drops_empty_hooks_key(self):
+        self.init_project()
+        run_cli(self.dir, "hook", "--install")
+        run_cli(self.dir, "hook", "--uninstall")
+        self.assertEqual(json.loads(read_text(self.settings_path())), {})
+        again = run_cli(self.dir, "hook", "--uninstall")
+        self.assertIn("no StateCat SessionStart hook", again.stdout)
+
+    def test_hook_installs_at_project_root_from_subfolder(self):
+        self.init_project()
+        sub = os.path.join(self.dir, "src")
+        os.makedirs(sub)
+        result = run_cli(sub, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(self.settings_path()))
+        self.assertFalse(os.path.exists(os.path.join(sub, ".claude")))
+
+    def test_hook_prints_entry_without_writing(self):
+        result = run_cli(self.dir, "hook")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("SessionStart", data["hooks"])
+        self.assertFalse(os.path.exists(self.settings_path()))
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_hook_command_uses_installed_statecat_without_script(self):
+        # pip-installed: no statecat.py in the project, a statecat command on PATH.
+        self.init_project("Pip Run")
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        bin_dir = os.path.join(self.dir, "fakebin")
+        os.makedirs(bin_dir)
+        fake = os.path.join(bin_dir, "statecat")
+        with open(fake, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write('#!/bin/sh\necho "installed statecat $1"\n')
+        os.chmod(fake, 0o755)
+        # PATH is colon-separated, so C:/x must become /c/x for Git Bash.
+        posix_bin = re.sub(r"^([A-Za-z]):", lambda m: "/" + m.group(1).lower(), bin_dir.replace("\\", "/"))
+        result = subprocess.run(
+            ["sh", "-c", 'PATH="%s:$PATH"; %s' % (posix_bin, command)], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed statecat show", result.stdout)
+        self.assertIn("installed statecat check", result.stdout)
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_hook_command_runs_show_and_check(self):
+        self.init_project("Hook Run")
+        shutil.copy(CLI, self.dir)
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        result = subprocess.run(
+            ["sh", "-c", command], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("# Project: Hook Run", result.stdout)
+        self.assertIn("check: clean", result.stdout)
 
     # v1.1: show --json, status, search.
     def test_show_json_is_machine_readable(self):
@@ -2305,7 +2709,8 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "move", "99", "Open")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no item #99", result.stderr)
-        self.assertIn("python3 statecat.py show", result.stderr)
+        # The hint names an interpreter that runs here: py on Windows.
+        self.assertIn("%s statecat.py show" % ("py" if sys.platform == "win32" else "python3"), result.stderr)
         result = run_cli(self.dir, "restore", "no-such-snapshot")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no snapshot 'no-such-snapshot'", result.stderr)

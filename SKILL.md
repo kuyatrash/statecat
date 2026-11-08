@@ -9,13 +9,16 @@ reconstructing it from scattered notes and old chats.
 A project using StateCat has this line in its agent instructions file
 (for example AGENTS.md):
 
-> Read STATE.md first, then run python3 statecat.py check, before asking about or working on this project.
+> Read STATE.md first, then run python3 statecat.py check (py statecat.py check on Windows if python3 is not found), before asking about or working on this project.
 
 That pointer is the real read-first and session-start check mechanism.
 This skill is supporting detail, not the trigger, because skills are
 advisory and may not fire. `init` installs the line into AGENTS.md
 (or CLAUDE.md) for new projects; `pointer --install` adds it to an
-existing project, and `pointer` just prints it.
+existing project, `pointer --uninstall` removes it, and `pointer`
+just prints it. In Claude Code, `hook --install` adds a
+SessionStart hook to `.claude/settings.json` that runs `show` and
+`check` at every session start.
 
 ## Session workflow
 
@@ -68,8 +71,9 @@ existing project, and `pointer` just prints it.
   operate on that project root; `init` refuses if a `STATE.md`
   already exists in a parent folder. The optional `statecat`
   launcher in the repo root forwards to `statecat.py` in the
-  same directory, so `./statecat check` works on Unix; on
-  Windows, use `python3 statecat.py <command>`. If
+  same directory, so `./statecat check` works on Unix and in Git
+  Bash (it tries `python3`, then `py`, then `python`); elsewhere on
+  Windows, use `py statecat.py <command>`. If
   `statecat.py` lives elsewhere, use that path instead, for
   example `python3 ~/workspace/statecat/statecat.py check`:
   `move 12 Open`, `update 12 <new wording>`,
