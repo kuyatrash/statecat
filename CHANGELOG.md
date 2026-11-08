@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The SessionStart hook runs the installed `statecat` command when
+  there is no `statecat.py` in the project root, so it works for a
+  pip install too; it used to print nothing there. `hook --install`
+  upgrades an existing StateCat hook to this command.
 - `hook --install` says "could not read" when `.claude/settings.json`
   cannot be opened (a folder in its place, no permission), instead
   of wrongly calling the file invalid JSON.

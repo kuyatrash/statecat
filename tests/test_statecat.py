@@ -1134,7 +1134,7 @@ class StateCatTest(unittest.TestCase):
             hook["command"]
             for group in settings.get("hooks", {}).get("SessionStart", [])
             for hook in group["hooks"]
-            if "statecat.py show" in hook["command"]
+            if "statecat" in hook["command"] and "show" in hook["command"]
         ]
 
     def test_hook_install_creates_settings(self):
@@ -1250,6 +1250,28 @@ class StateCatTest(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertIn("SessionStart", data["hooks"])
         self.assertFalse(os.path.exists(self.settings_path()))
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_hook_command_uses_installed_statecat_without_script(self):
+        # pip-installed: no statecat.py in the project, a statecat command on PATH.
+        self.init_project("Pip Run")
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        bin_dir = os.path.join(self.dir, "fakebin")
+        os.makedirs(bin_dir)
+        fake = os.path.join(bin_dir, "statecat")
+        with open(fake, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write('#!/bin/sh\necho "installed statecat $1"\n')
+        os.chmod(fake, 0o755)
+        # PATH is colon-separated, so C:/x must become /c/x for Git Bash.
+        posix_bin = re.sub(r"^([A-Za-z]):", lambda m: "/" + m.group(1).lower(), bin_dir.replace("\\", "/"))
+        result = subprocess.run(
+            ["sh", "-c", 'PATH="%s:$PATH"; %s' % (posix_bin, command)], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed statecat show", result.stdout)
+        self.assertIn("installed statecat check", result.stdout)
 
     @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
     def test_hook_command_runs_show_and_check(self):

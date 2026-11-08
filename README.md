@@ -57,7 +57,9 @@ hook twice, upgrades an older StateCat hook in place, and refuses
 to touch a settings file that is not valid JSON. The file is
 rewritten with two-space indentation. The hook tries `python3`,
 then `py`, then `python`, so it still works on Windows where
-`python3` is a Microsoft Store stub. `hook --uninstall` removes
+`python3` is a Microsoft Store stub. When there is no `statecat.py`
+in the project root (StateCat installed with pip), it runs the
+installed `statecat` command instead. `hook --uninstall` removes
 only the StateCat entry, and `hook` alone prints the entry.
 
 ## Before and after

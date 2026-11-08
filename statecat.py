@@ -2143,10 +2143,13 @@ def cmd_pointer(args):
 # Windows). It tries python3, then py, then python, because on Windows
 # python3 is often a Microsoft Store stub that runs nothing, and the
 # trailing exit 0 would otherwise hide that the hook did nothing.
+# When statecat.py is not in the project root (installed with pip),
+# it runs the installed statecat command instead.
 HOOK_COMMAND = (
-    'cd "$CLAUDE_PROJECT_DIR" && { P=python3; $P -c \'\' 2>/dev/null || P=py; '
-    "$P -c '' 2>/dev/null || P=python; "
-    "$P statecat.py show && $P statecat.py check; }; exit 0"
+    'cd "$CLAUDE_PROJECT_DIR" && { if [ -f statecat.py ]; then '
+    "P=python3; $P -c '' 2>/dev/null || P=py; $P -c '' 2>/dev/null || P=python; "
+    'S="$P statecat.py"; else S=statecat; fi; '
+    "$S show && $S check; }; exit 0"
 )
 HOOK_SETTINGS = os.path.join(".claude", "settings.json")
 
@@ -2157,7 +2160,12 @@ def hook_entry():
 
 def is_statecat_hook(hook):
     command = hook.get("command") if isinstance(hook, dict) else None
-    return isinstance(command, str) and "statecat.py show" in command and "statecat.py check" in command
+    if not isinstance(command, str):
+        return False
+    if command == HOOK_COMMAND:
+        return True
+    # Older StateCat hook commands, recognised so install upgrades them.
+    return "statecat.py show" in command and "statecat.py check" in command
 
 
 def load_hook_settings(path):
