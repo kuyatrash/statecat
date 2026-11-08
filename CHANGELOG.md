@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `hook --install` says "could not read" when `.claude/settings.json`
+  cannot be opened (a folder in its place, no permission), instead
+  of wrongly calling the file invalid JSON.
+- The "no item #N" hint names an interpreter that runs on the
+  platform: `py statecat.py show` on Windows, where `python3` is
+  often a Microsoft Store stub, and `python3 statecat.py show`
+  elsewhere.
 - `search` matches words on an item's hand-wrapped continuation
   lines, not just its first line, and prints the whole item.
   Matching uses `casefold()`, so e.g. German `ß` matches `SS`.

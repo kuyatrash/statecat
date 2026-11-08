@@ -2170,7 +2170,9 @@ def load_hook_settings(path):
     try:
         with open(path, "r", encoding="utf-8-sig") as handle:
             settings = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        return None, "could not read %s (%s); nothing was changed" % (path, exc)
+    except ValueError as exc:
         return None, "%s is not valid JSON (%s); fix it by hand, nothing was changed" % (path, exc)
     if not isinstance(settings, dict):
         return None, "%s is not a JSON object; nothing was changed" % path
@@ -2479,8 +2481,8 @@ def find_item_or_fail(state, item_id):
     item = state.find(item_id)
     if item is None:
         sys.stderr.write(
-            "error: no item #%d in %s; run 'python3 statecat.py show' "
-            "to list items\n" % (item_id, STATE)
+            "error: no item #%d in %s; run '%s statecat.py show' "
+            "to list items\n" % (item_id, STATE, "py" if sys.platform == "win32" else "python3")
         )
         sys.exit(1)
     return item

@@ -1189,6 +1189,15 @@ class StateCatTest(unittest.TestCase):
         self.assertIn("not valid JSON", result.stderr)
         self.assertEqual(read_text(self.settings_path()), '{"hooks": {,}')
 
+    def test_hook_install_reports_unreadable_settings_plainly(self):
+        self.init_project()
+        os.makedirs(self.settings_path())  # a folder where the file should be
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read", result.stderr)
+        self.assertNotIn("not valid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_hook_install_refuses_wrong_shapes(self):
         self.init_project()
         for text in ('[]', '{"hooks": []}', '{"hooks": {"SessionStart": {}}}'):
@@ -2669,7 +2678,8 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "move", "99", "Open")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no item #99", result.stderr)
-        self.assertIn("python3 statecat.py show", result.stderr)
+        # The hint names an interpreter that runs here: py on Windows.
+        self.assertIn("%s statecat.py show" % ("py" if sys.platform == "win32" else "python3"), result.stderr)
         result = run_cli(self.dir, "restore", "no-such-snapshot")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no snapshot 'no-such-snapshot'", result.stderr)
