@@ -2063,7 +2063,9 @@ def cmd_init(args):
     if os.path.exists(state_path) or os.path.exists(archive_path):
         sys.stderr.write("error: %s or %s already exists; refusing to overwrite.\n" % (STATE, ARCHIVE))
         return 1
-    project = args.project or os.path.basename(os.path.abspath(directory)) or "My Project"
+    # A blank name falls back like an omitted one, instead of writing
+    # an empty "# Project:" header.
+    project = (args.project or "").strip() or os.path.basename(os.path.abspath(directory)) or "My Project"
     # A newline or control character in the project name would
     # be interpolated into STATE.md as real file structure, so
     # it is refused before anything is written.

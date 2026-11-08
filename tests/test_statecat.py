@@ -975,6 +975,15 @@ class StateCatTest(unittest.TestCase):
             if args[0] != "status":
                 self.assertIn("ship it ✓", result.stdout.decode("utf-8"), args)
 
+    def test_init_blank_name_falls_back_to_folder_name(self):
+        result = run_cli(self.dir, "init", "   ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = read_text(state_path(self.dir)).splitlines()[0]
+        self.assertEqual(first, "# Project: %s" % os.path.basename(os.path.abspath(self.dir)))
+        with tempfile.TemporaryDirectory() as padded:
+            self.assertEqual(run_cli(padded, "init", "  Named  ").returncode, 0)
+            self.assertEqual(read_text(state_path(padded)).splitlines()[0], "# Project: Named")
+
     def test_search_finds_words_on_wrapped_continuation_lines(self):
         self.init_project()
         path = state_path(self.dir)

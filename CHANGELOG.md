@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `init` with a blank project name uses the folder name, as when the
+  name is omitted, instead of writing an empty `# Project:` header;
+  surrounding spaces in a name are trimmed.
 - The SessionStart hook runs the installed `statecat` command when
   there is no `statecat.py` in the project root, so it works for a
   pip install too; it used to print nothing there. `hook --install`
