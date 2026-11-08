@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "cd \"$CLAUDE_PROJECT_DIR\" && python3 statecat.py show && python3 statecat.py check; exit 0"}]}
+    ]
+  }
+}
