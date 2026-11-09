@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-11-09
+
+Safety release after v1.3.0: the stale-lock takeover race (SC-17) and
+the hook and pointer findings from the same review (SC-08 to SC-20),
+plus the new `hook` and `pointer --uninstall` commands. Upgrading:
+
+- Run `hook --install` once if you use the Claude Code hook. It
+  upgrades the 1.3.0 hook (and the hand-written one from the setup
+  instructions) to the new command, which reports failures and only
+  uses Python 3.8 or newer.
+- `pointer --uninstall` now deletes AGENTS.md only if StateCat
+  recorded creating it, and that record starts with 1.4.0. An
+  AGENTS.md made by an older `init` is kept, holding just its header,
+  so delete it by hand if you want it gone.
+- `hook` and `pointer` install/uninstall take the project lock and
+  exit 1 when a file cannot be read or written, so scripts that
+  relied on exit 0 there may now see a failure they did not see
+  before.
+- `.statecat/` gains `lock.break` (the lock-breaking guard) and
+  `pointer-created`; both are covered by the existing `.statecat/`
+  gitignore line.
 
 - Breaking a stale lock can no longer create two writers (SC-17). A
   waiter used to rename an old-looking lock aside *before* checking

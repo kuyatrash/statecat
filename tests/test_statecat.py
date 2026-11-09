@@ -1686,7 +1686,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.3.0"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.4.0"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))

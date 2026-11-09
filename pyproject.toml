@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "statecat"
-version = "1.3.0"
+version = "1.4.0"
 description = "One living project state, readable by any agent in one read."
 readme = "README.md"
 requires-python = ">=3.8"
