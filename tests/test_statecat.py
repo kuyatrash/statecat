@@ -1158,7 +1158,7 @@ class StateCatTest(unittest.TestCase):
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         outside_settings = os.path.join(outside.name, "settings.json")
-        with open(outside_settings, "w", encoding="utf-8") as handle:
+        with open(outside_settings, "w", encoding="utf-8", newline="") as handle:
             handle.write('{"model": "someone else"}\n')
         self._symlink_or_skip(outside.name, os.path.join(self.dir, ".claude"))
         result = run_cli(self.dir, "hook", "--install")
@@ -1170,7 +1170,7 @@ class StateCatTest(unittest.TestCase):
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         outside_file = os.path.join(outside.name, "AGENTS.md")
-        with open(outside_file, "w", encoding="utf-8") as handle:
+        with open(outside_file, "w", encoding="utf-8", newline="") as handle:
             handle.write("# Someone else's file\n")
         self._symlink_or_skip(outside_file, os.path.join(self.dir, "AGENTS.md"))
         result = run_cli(self.dir, "pointer", "--install")
@@ -1181,7 +1181,7 @@ class StateCatTest(unittest.TestCase):
         os.unlink(os.path.join(self.dir, "AGENTS.md"))
         os.makedirs(os.path.join(self.dir, "docs"))
         inside = os.path.join(self.dir, "docs", "agents.md")
-        with open(inside, "w", encoding="utf-8") as handle:
+        with open(inside, "w", encoding="utf-8", newline="") as handle:
             handle.write("# Rules\n")
         os.symlink(os.path.join("docs", "agents.md"), os.path.join(self.dir, "CLAUDE.md"))
         result = run_cli(self.dir, "pointer", "--install")
@@ -1221,7 +1221,7 @@ class StateCatTest(unittest.TestCase):
     def test_sc19_pointer_uninstall_exits_non_zero_when_a_file_cannot_be_read(self):
         with open(os.path.join(self.dir, "AGENTS.md"), "wb") as handle:
             handle.write(b"\xff\xfe not utf-8 \x80\n")
-        with open(os.path.join(self.dir, "CLAUDE.md"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.dir, "CLAUDE.md"), "w", encoding="utf-8", newline="") as handle:
             handle.write("# Rules\n%s\n" % POINTER)
         result = run_cli(self.dir, "pointer", "--uninstall")
         self.assertEqual(result.returncode, 1)
