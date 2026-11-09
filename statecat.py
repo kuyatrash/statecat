@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.3.0: one living project state, readable by any agent in one read.
+"""StateCat v1.4.0: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -82,7 +82,7 @@ import time
 import uuid
 from datetime import date
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -3403,7 +3403,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.3.0: one living project state, readable by any agent "
+            "StateCat v1.4.0: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )
