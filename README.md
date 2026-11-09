@@ -41,7 +41,11 @@ paired backups are never committed. Use `--no-pointer` or
 has a state file, `python3 statecat.py pointer --install` adds the
 line (upgrading an older wording in place instead of adding a
 second line), `python3 statecat.py pointer --uninstall` removes it,
-and `python3 statecat.py pointer` just prints it.
+and `python3 statecat.py pointer` just prints it. Only a line that
+is exactly the pointer counts; the pointer quoted in a sentence or
+a code block is left alone. Uninstall deletes AGENTS.md only if
+StateCat created it and nothing else was added; it exits non-zero
+when a file could not be read or written.
 
 ```text
 Read STATE.md first, then run python3 statecat.py check (py statecat.py check on Windows if python3 is not found), before asking about or working on this project.
@@ -53,14 +57,21 @@ For Claude Code, `python3 statecat.py hook --install` also adds a
 SessionStart hook to `.claude/settings.json` that runs `show` and
 `check` at the start of every session (from the next session, or
 after `/clear`). It keeps every existing setting, never adds the
-hook twice, upgrades an older StateCat hook in place, and refuses
-to touch a settings file that is not valid JSON. The file is
-rewritten with two-space indentation. The hook tries `python3`,
-then `py`, then `python`, so it still works on Windows where
-`python3` is a Microsoft Store stub. When there is no `statecat.py`
-in the project root (StateCat installed with pip), it runs the
-installed `statecat` command instead. `hook --uninstall` removes
-only the StateCat entry, and `hook` alone prints the entry.
+hook twice, upgrades an older StateCat hook in place (and removes
+any older one left beside the current one), and refuses to touch a
+settings file that is not valid JSON, that changed while it was
+being updated, or that is a link leading outside the project. Only
+hook commands StateCat itself wrote are treated as StateCat's: your
+own command that also runs `statecat.py show` is left alone. The
+file keeps its own indentation, line endings and non-ASCII text, so
+the change is a small diff. The hook uses the first of `python3`,
+`py` and `python` that is Python 3.8 or newer, so it still works on
+Windows where `python3` is a Microsoft Store stub. When there is no
+`statecat.py` in the project root (StateCat installed with pip), it
+runs the installed `statecat` command instead. It runs `show` and
+`check` separately and says so in its output when either fails,
+instead of failing silently. `hook --uninstall` removes only the
+StateCat entry, and `hook` alone prints the entry.
 
 ## Before and after
 

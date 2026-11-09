@@ -293,18 +293,15 @@ class StateFile:
     def _parse(self):
         bucket = None
         last_item = None
-        in_fence = False
+        fences = FenceTracker()
         seen_headings = set()
         for index, (content, _ending) in enumerate(self.lines):
             # Fenced code blocks are not structure: a heading or
-            # list line inside ``` fences is an example, not a
-            # bucket or an item. Toggle on fence lines and skip
-            # everything inside, including the fences themselves.
-            if content.lstrip().startswith("```"):
-                in_fence = not in_fence
+            # list line inside a ``` or ~~~ fence is an example,
+            # not a bucket or an item. Skip the fence lines and
+            # everything inside them (see FenceTracker).
+            if fences.step(content):
                 last_item = None
-                continue
-            if in_fence:
                 continue
             if content.startswith("> Last ID used:"):
                 if self.last_id is not None:
@@ -424,12 +421,9 @@ class StateFile:
         """
         start = None
         end = len(self.lines)
-        in_fence = False
+        fences = FenceTracker()
         for index, (content, _ending) in enumerate(self.lines):
-            if content.lstrip().startswith("```"):
-                in_fence = not in_fence
-                continue
-            if in_fence:
+            if fences.step(content):
                 continue
             # Match the heading the way _parse reads it (stripped), so a
             # trailing space an editor left on "## Open " does not make
@@ -440,6 +434,48 @@ class StateFile:
                 end = index
                 break
         return start, end
+
+
+FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+
+
+class FenceTracker:
+    """Track fenced code blocks line by line, CommonMark-style.
+
+    A fence opens with three or more backticks or tildes. It closes
+    only on a line made of the same character, at least as many of
+    them as opened it, and nothing else but whitespace, so a ````
+    block can show ``` lines and a ~~~ block can show backtick
+    fences without either ending it (SC-18). A backtick opener's
+    info string may not contain a backtick (that is inline code,
+    not a fence). Leading indentation is accepted on any line, as
+    it was before, so existing files parse the same. An unclosed
+    fence runs to the end of the file.
+    """
+
+    def __init__(self):
+        self.char = None
+        self.length = 0
+
+    def step(self, content):
+        """True when this line is a fence line or inside a fence."""
+        match = FENCE_OPEN_RE.match(content)
+        if self.char is None:
+            if match is None:
+                return False
+            run, info = match.group(1), match.group(2)
+            if run[0] == "`" and "`" in info:
+                return False
+            self.char, self.length = run[0], len(run)
+            return True
+        if (
+            match is not None
+            and match.group(1)[0] == self.char
+            and len(match.group(1)) >= self.length
+            and not match.group(2).strip()
+        ):
+            self.char, self.length = None, 0
+        return True
 
 
 def read_state_and_archive(directory):
@@ -2116,16 +2152,129 @@ POINTER_FILES = ("AGENTS.md", "CLAUDE.md")
 POINTER_CREATED_HEADER = "# Project instructions\n\n"
 
 
+# Where uninstall may delete an AGENTS.md: only one StateCat itself
+# created. The name of the file init / pointer --install created is
+# recorded here, under .statecat/, so a user's own file that happens
+# to hold just the same header and the pointer is never deleted.
+POINTER_CREATED_MARKER = "pointer-created"
+
+
 def is_pointer_line(content):
-    stripped = content.strip()
+    stripped = content.lstrip("﻿").strip()
     return stripped == POINTER_LINE or stripped in LEGACY_POINTER_LINES
 
 
+def _pointer_line_indices(lines):
+    """Indices of real pointer lines: a whole line holding exactly a
+    pointer wording, outside fenced code. A pointer quoted inside a
+    sentence or shown in a code block is documentation, not the
+    pointer, so install must not treat it as already installed and
+    uninstall must not remove it (SC-13)."""
+    fences = FenceTracker()
+    found = []
+    for index, line in enumerate(lines):
+        if fences.step(line.rstrip("\r\n")):
+            continue
+        if is_pointer_line(line):
+            found.append(index)
+    return found
+
+
+def _resolves_inside(directory, path):
+    """True when path, with every symlink resolved, is inside directory."""
+    root = os.path.normcase(os.path.realpath(directory))
+    target = os.path.normcase(os.path.realpath(path))
+    return target == root or target.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _outside_project_error(directory, path):
+    """Error text when writing path would leave the project, else None.
+
+    Hook, pointer and .gitignore writes follow symlinks, so a
+    symlinked .claude/, settings.json, AGENTS.md, CLAUDE.md or
+    .gitignore that points outside the project would make StateCat
+    rewrite a file it has no business touching (SC-11). A link that
+    stays inside the project (CLAUDE.md -> AGENTS.md) is fine."""
+    if _resolves_inside(directory, path):
+        return None
+    return (
+        "%s resolves to %s, outside this project; refusing to write "
+        "through a link that leaves the project. Nothing was changed."
+        % (os.path.relpath(path, directory), os.path.realpath(path))
+    )
+
+
+def _read_bytes_if_exists(path):
+    """File bytes, or None when the file does not exist. Other read
+    errors (a folder in its place, no permission) raise OSError."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def _write_if_unchanged(path, expected, data):
+    """Atomically replace path with data, but only if its bytes are
+    still `expected` (None: it must still not exist). Returns an
+    error message, or None on success.
+
+    The StateCat lock keeps two StateCat processes apart, but an
+    editor or Claude Code itself can change these files at any time.
+    Re-reading just before the replace turns a lost update into a
+    clean refusal (SC-08). The re-read and the replace are still two
+    steps, so a change landing between them is not caught; the
+    window is a single read."""
+    try:
+        current = _read_bytes_if_exists(path)
+    except OSError as exc:
+        return "could not re-read %s before writing (%s); nothing was written" % (path, exc)
+    if current != expected:
+        return (
+            "%s changed while StateCat was updating it; nothing was "
+            "written. Run the command again." % path
+        )
+    try:
+        atomic_write_bytes(path, data)
+    except OSError as exc:
+        return "could not write %s: %s" % (path, exc)
+    return None
+
+
+def _record_created_pointer_file(directory, name):
+    path = os.path.join(directory, ".statecat", POINTER_CREATED_MARKER)
+    try:
+        ensure_dir(os.path.dirname(path))
+        atomic_write_bytes(path, (name + "\n").encode("utf-8"))
+    except OSError:
+        # Not fatal: without the marker, uninstall just keeps the file.
+        pass
+
+
+def _created_pointer_file(directory):
+    path = os.path.join(directory, ".statecat", POINTER_CREATED_MARKER)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _forget_created_pointer_file(directory):
+    try:
+        os.unlink(os.path.join(directory, ".statecat", POINTER_CREATED_MARKER))
+    except OSError:
+        pass
+
+
 def install_pointer(directory, create=True):
-    """Append the read-first pointer line to the project's agent
+    """Add the read-first pointer line to the project's agent
     instructions file (AGENTS.md, else CLAUDE.md), creating AGENTS.md
-    when neither exists and create is true. Returns a short message
-    describing what happened, or None when nothing was done."""
+    when neither exists and create is true.
+
+    Returns (message, ok): message is a short description of what
+    happened, or None when nothing was done; ok is False when the
+    pointer could not be installed (the reason is already on stderr)."""
     target = None
     for name in POINTER_FILES:
         path = os.path.join(directory, name)
@@ -2134,42 +2283,52 @@ def install_pointer(directory, create=True):
             break
     if target is None:
         if not create:
-            return None
+            return None, True
         target = os.path.join(directory, "AGENTS.md")
-        try:
-            with open(target, "w", encoding="utf-8", newline="") as handle:
-                handle.write("%s%s\n" % (POINTER_CREATED_HEADER, POINTER_LINE))
-        except OSError as exc:
-            sys.stderr.write("warning: could not create %s: %s\n" % (target, exc))
-            return None
-        return "created AGENTS.md with pointer"
+        error = _outside_project_error(directory, target)
+        if error is None:
+            data = ("%s%s\n" % (POINTER_CREATED_HEADER, POINTER_LINE)).encode("utf-8")
+            error = _write_if_unchanged(target, None, data)
+        if error:
+            sys.stderr.write("warning: could not create AGENTS.md: %s\n" % error)
+            return None, False
+        _record_created_pointer_file(directory, "AGENTS.md")
+        return "created AGENTS.md with pointer", True
+    name = os.path.basename(target)
+    error = _outside_project_error(directory, target)
+    if error:
+        sys.stderr.write("warning: %s\n" % error)
+        return None, False
     try:
-        # Plain utf-8, not utf-8-sig: a BOM stays in content as
-        # U+FEFF, so the in-place upgrade below writes it back.
-        with open(target, "r", encoding="utf-8", newline="") as handle:
-            content = handle.read()
+        raw = _read_bytes_if_exists(target)
+        # Plain utf-8, not utf-8-sig: a BOM stays in the text as
+        # U+FEFF, so writing the text back keeps it.
+        content = (raw or b"").decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         sys.stderr.write("warning: could not read %s: %s\n" % (target, exc))
-        return None
-    if POINTER_LINE in content:
-        return "pointer already in %s" % os.path.basename(target)
-    for legacy in LEGACY_POINTER_LINES:
-        if legacy in content:
-            try:
-                atomic_write_bytes(target, content.replace(legacy, POINTER_LINE, 1).encode("utf-8"))
-            except OSError as exc:
-                sys.stderr.write("warning: could not update %s: %s\n" % (target, exc))
-                return None
-            return "updated pointer in %s" % os.path.basename(target)
-    try:
-        with open(target, "a", encoding="utf-8", newline="") as handle:
-            if content and not content.endswith("\n"):
-                handle.write("\n")
-            handle.write("%s\n" % POINTER_LINE)
-    except OSError as exc:
-        sys.stderr.write("warning: could not update %s: %s\n" % (target, exc))
-        return None
-    return "added pointer to %s" % os.path.basename(target)
+        return None, False
+    lines = content.splitlines(True)
+    found = _pointer_line_indices(lines)
+    if any(lines[index].lstrip("﻿").strip() == POINTER_LINE for index in found):
+        return "pointer already in %s" % name, True
+    if found:
+        # An older wording: replace just the wording, keeping the
+        # line's indentation and line ending.
+        index = found[0]
+        old = lines[index].lstrip("﻿").strip()
+        lines[index] = lines[index].replace(old, POINTER_LINE, 1)
+        message = "updated pointer in %s" % name
+    else:
+        newline = "\r\n" if "\r\n" in content else "\n"
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += newline
+        lines.append(POINTER_LINE + newline)
+        message = "added pointer to %s" % name
+    error = _write_if_unchanged(target, raw, "".join(lines).encode("utf-8"))
+    if error:
+        sys.stderr.write("warning: could not update %s: %s\n" % (name, error))
+        return None, False
+    return message, True
 
 
 def ensure_gitignore(directory):
@@ -2177,6 +2336,10 @@ def ensure_gitignore(directory):
     committed. Creates .gitignore when there is none. Returns a short
     message, or None when nothing was done."""
     path = os.path.join(directory, ".gitignore")
+    error = _outside_project_error(directory, path)
+    if error:
+        sys.stderr.write("warning: could not update .gitignore: %s\n" % error)
+        return None
     try:
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8", newline="") as handle:
@@ -2224,7 +2387,9 @@ def cmd_init(args):
     print("created %s" % STATE)
     print("created %s" % ARCHIVE)
     if not getattr(args, "no_pointer", False):
-        message = install_pointer(directory)
+        # A pointer that could not be installed is a warning here,
+        # not a failure: the state files were created.
+        message, _ok = install_pointer(directory)
         if message:
             print(message)
     if not getattr(args, "no_gitignore", False):
@@ -2236,37 +2401,66 @@ def cmd_init(args):
 
 def uninstall_pointer(directory):
     """Remove every pointer line (current or legacy wording) from
-    AGENTS.md and CLAUDE.md. A file that is left holding only the
-    header init wrote when it created the file is deleted, since
-    init made it. Returns a list of short messages."""
+    AGENTS.md and CLAUDE.md.
+
+    A file is deleted only when StateCat recorded creating it and it
+    is left holding only the header StateCat wrote (SC-12); a file
+    the user made is kept, even if it now holds just that header.
+    Returns (messages, ok): ok is False when any file could not be
+    read or written (the reason is already on stderr), so the
+    command can exit non-zero instead of claiming success (SC-19)."""
     messages = []
+    ok = True
+    created = _created_pointer_file(directory)
     for name in POINTER_FILES:
         path = os.path.join(directory, name)
         if not os.path.isfile(path):
             continue
+        error = _outside_project_error(directory, path)
+        if error:
+            sys.stderr.write("warning: %s\n" % error)
+            ok = False
+            continue
         try:
-            with open(path, "r", encoding="utf-8", newline="") as handle:
-                lines = handle.readlines()
+            raw = _read_bytes_if_exists(path)
+            text = (raw or b"").decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             sys.stderr.write("warning: could not read %s: %s\n" % (path, exc))
+            ok = False
             continue
         bom = ""
-        if lines and lines[0].startswith("﻿"):
-            bom, lines[0] = "﻿", lines[0][1:]
-        kept = [line for line in lines if not is_pointer_line(line)]
-        if len(kept) == len(lines):
+        if text.startswith("﻿"):
+            bom, text = "﻿", text[1:]
+        lines = text.splitlines(True)
+        drop = set(_pointer_line_indices(lines))
+        if not drop:
             continue
-        remaining = "".join(kept)
-        try:
-            if remaining.replace("\r\n", "\n") in (POINTER_CREATED_HEADER, POINTER_CREATED_HEADER.rstrip("\n") + "\n"):
+        remaining = "".join(line for index, line in enumerate(lines) if index not in drop)
+        header_only = remaining.replace("\r\n", "\n") in (
+            POINTER_CREATED_HEADER, POINTER_CREATED_HEADER.rstrip("\n") + "\n"
+        )
+        if header_only and created == name:
+            try:
+                if _read_bytes_if_exists(path) != raw:
+                    raise OSError("it changed while StateCat was updating it")
                 os.unlink(path)
-                messages.append("removed %s (it held only the pointer)" % name)
-            else:
-                atomic_write_bytes(path, (bom + remaining).encode("utf-8"))
-                messages.append("removed pointer from %s" % name)
-        except OSError as exc:
-            sys.stderr.write("warning: could not update %s: %s\n" % (path, exc))
-    return messages
+            except OSError as exc:
+                sys.stderr.write("warning: could not remove %s: %s\n" % (name, exc))
+                ok = False
+                continue
+            _forget_created_pointer_file(directory)
+            messages.append("removed %s (StateCat created it and it held only the pointer)" % name)
+            continue
+        error = _write_if_unchanged(path, raw, (bom + remaining).encode("utf-8"))
+        if error:
+            sys.stderr.write("warning: could not update %s: %s\n" % (name, error))
+            ok = False
+            continue
+        if header_only:
+            messages.append("removed pointer from %s (kept the file: StateCat did not create it)" % name)
+        else:
+            messages.append("removed pointer from %s" % name)
+    return messages, ok
 
 
 def cmd_pointer(args):
@@ -2274,32 +2468,43 @@ def cmd_pointer(args):
     # a subfolder, not on a new AGENTS.md in the subfolder.
     directory = find_project_root() or os.getcwd()
     if getattr(args, "install", False):
-        message = install_pointer(directory)
+        message, ok = install_pointer(directory)
         if message:
             print(message)
-        return 0
+        return 0 if ok else 1
     if getattr(args, "uninstall", False):
-        messages = uninstall_pointer(directory)
+        messages, ok = uninstall_pointer(directory)
         for message in messages:
             print(message)
-        if not messages:
+        if not messages and ok:
             print("no pointer found in %s" % " or ".join(POINTER_FILES))
-        return 0
+        return 0 if ok else 1
     print(POINTER_LINE)
     return 0
 
 
 # Claude Code SessionStart hook. It runs in a POSIX shell (Git Bash on
-# Windows). It tries python3, then py, then python, because on Windows
-# python3 is often a Microsoft Store stub that runs nothing, and the
-# trailing exit 0 would otherwise hide that the hook did nothing.
-# When statecat.py is not in the project root (installed with pip),
-# it runs the installed statecat command instead.
+# Windows). With statecat.py in the project root it uses the first of
+# python3, py, python that is really Python 3.8 or newer: on Windows
+# python3 is often a Microsoft Store stub, and an old Python 2 or 3.7
+# runs an empty program fine but cannot run StateCat (SC-16). Without
+# statecat.py (installed with pip) it runs the installed statecat
+# command. show and check run separately, so a failed show no longer
+# skips check, and any failure is reported in the hook's own output
+# (SC-10). The hook still exits 0 on purpose: Claude Code adds a
+# SessionStart hook's stdout to the session only on exit 0, so that
+# is the way the agent actually sees "show failed"; a non-zero exit
+# would hide the message from the agent instead.
 HOOK_COMMAND = (
-    'cd "$CLAUDE_PROJECT_DIR" && { if [ -f statecat.py ]; then '
-    "P=python3; $P -c '' 2>/dev/null || P=py; $P -c '' 2>/dev/null || P=python; "
-    'S="$P statecat.py"; else S=statecat; fi; '
-    "$S show && $S check; }; exit 0"
+    'cd "$CLAUDE_PROJECT_DIR" || { echo "statecat hook: could not cd to the project folder"; exit 0; }; '
+    "if [ -f statecat.py ]; then S=; for P in python3 py python; do "
+    "if $P -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; "
+    'then S="$P statecat.py"; break; fi; done; '
+    '[ -n "$S" ] || { echo "statecat hook: no Python 3.8+ found (tried python3, py, python)"; exit 0; }; '
+    "else S=statecat; fi; "
+    '$S show 2>&1 || echo "statecat hook: show failed (exit $?); STATE.md was not loaded"; '
+    '$S check 2>&1 || echo "statecat hook: check failed or reported problems (exit $?)"; '
+    "exit 0"
 )
 HOOK_SETTINGS = os.path.join(".claude", "settings.json")
 
@@ -2316,6 +2521,11 @@ def hook_entry():
 # must not replace it nor uninstall delete it (SC-09). Add the old
 # HOOK_COMMAND here whenever HOOK_COMMAND changes.
 LEGACY_HOOK_COMMANDS = (
+    # 1.3.0 hook --install, with the installed-command fallback.
+    'cd "$CLAUDE_PROJECT_DIR" && { if [ -f statecat.py ]; then '
+    "P=python3; $P -c '' 2>/dev/null || P=py; $P -c '' 2>/dev/null || P=python; "
+    'S="$P statecat.py"; else S=statecat; fi; '
+    "$S show && $S check; }; exit 0",
     # hook --install before the installed-command fallback.
     'cd "$CLAUDE_PROJECT_DIR" && { P=python3; $P -c \'\' 2>/dev/null || P=py; '
     "$P -c '' 2>/dev/null || P=python; "
@@ -2335,18 +2545,15 @@ def is_statecat_hook(hook):
     return command == HOOK_COMMAND or command in LEGACY_HOOK_COMMANDS
 
 
-def load_hook_settings(path):
-    """Return (settings, error). A missing file gives {}. Anything
-    that is not a JSON object with an object 'hooks' and a list
-    'SessionStart' is an error, so a file we cannot safely merge
-    into is never overwritten."""
-    if not os.path.exists(path):
+def parse_hook_settings(path, raw):
+    """Return (settings, error) from the file's bytes (None: missing,
+    which gives {}). Anything that is not a JSON object with an object
+    'hooks' and a list 'SessionStart' is an error, so a file we cannot
+    safely merge into is never overwritten."""
+    if raw is None:
         return {}, None
     try:
-        with open(path, "r", encoding="utf-8-sig") as handle:
-            settings = json.load(handle)
-    except OSError as exc:
-        return None, "could not read %s (%s); nothing was changed" % (path, exc)
+        settings = json.loads(raw.decode("utf-8-sig"))
     except ValueError as exc:
         return None, "%s is not valid JSON (%s); fix it by hand, nothing was changed" % (path, exc)
     if not isinstance(settings, dict):
@@ -2359,9 +2566,51 @@ def load_hook_settings(path):
     return settings, None
 
 
-def write_hook_settings(path, settings):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    atomic_write_bytes(path, (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
+def dump_hook_settings(settings, raw):
+    """Serialise settings in the existing file's own style, so a hook
+    change is a small diff instead of a rewrite of the whole file
+    (SC-20): the same indent (spaces or a tab, or one line), line
+    endings, final newline, BOM, and non-ASCII characters kept as
+    they are rather than escaped. Key order is kept by json itself.
+    A new file gets two-space indentation. Layout json cannot
+    express -- a short array kept on one line, aligned values, extra
+    blank lines -- is still normalised."""
+    text = raw.decode("utf-8", "replace") if raw is not None else ""
+    bom = text.startswith("﻿")
+    body = text[1:] if bom else text
+    newline = "\r\n" if "\r\n" in body else "\n"
+    indent = 2
+    match = re.search(r"\n([ \t]+)\S", body)
+    if match:
+        whitespace = match.group(1)
+        indent = "\t" if whitespace.startswith("\t") else len(whitespace)
+    elif body.strip() and "\n" not in body.strip():
+        indent = None
+    ensure_ascii = "\\u" in body and not any(ord(char) > 127 for char in body)
+    out = json.dumps(settings, indent=indent, ensure_ascii=ensure_ascii)
+    if body.endswith("\n") or not body:
+        out += "\n"
+    out = out.replace("\n", newline)
+    return (("﻿" if bom else "") + out).encode("utf-8")
+
+
+def _remove_hooks(settings, pairs):
+    """Remove (group, hook) pairs; drop only groups this emptied, never
+    ones the user left empty, and then empty SessionStart / hooks."""
+    emptied = []
+    for group, hook in pairs:
+        group["hooks"] = [item for item in group["hooks"] if item is not hook]
+        if not group["hooks"]:
+            emptied.append(group)
+    hooks = settings["hooks"]
+    hooks["SessionStart"] = [
+        group for group in hooks["SessionStart"]
+        if not any(group is empty for empty in emptied)
+    ]
+    if not hooks["SessionStart"]:
+        del hooks["SessionStart"]
+    if not hooks:
+        del settings["hooks"]
 
 
 def cmd_hook(args):
@@ -2370,7 +2619,16 @@ def cmd_hook(args):
         return 0
     directory = find_project_root() or os.getcwd()
     path = os.path.join(directory, HOOK_SETTINGS)
-    settings, error = load_hook_settings(path)
+    error = _outside_project_error(directory, path)
+    if error:
+        sys.stderr.write("error: %s\n" % error)
+        return 1
+    try:
+        raw = _read_bytes_if_exists(path)
+    except OSError as exc:
+        sys.stderr.write("error: could not read %s (%s); nothing was changed\n" % (path, exc))
+        return 1
+    settings, error = parse_hook_settings(path, raw)
     if error:
         sys.stderr.write("error: %s\n" % error)
         return 1
@@ -2381,14 +2639,23 @@ def cmd_hook(args):
         for hook in group["hooks"] if is_statecat_hook(hook)
     ]
     if args.install:
-        if any(hook.get("command") == HOOK_COMMAND for _group, hook in found):
-            print("SessionStart hook already in %s" % HOOK_SETTINGS)
-            return 0
-        if found:
+        current = [pair for pair in found if pair[1]["command"].strip() == HOOK_COMMAND]
+        if current:
+            # Keep the first current hook; drop duplicates and older
+            # StateCat hooks left beside it, so two StateCat hooks
+            # never both run (SC-15).
+            keep = current[0][1]
+            extra = [pair for pair in found if pair[1] is not keep]
+            if not extra:
+                print("SessionStart hook already in %s" % HOOK_SETTINGS)
+                return 0
+            _remove_hooks(settings, extra)
+            message = "removed %d duplicate or older StateCat hook(s) from %s" % (len(extra), HOOK_SETTINGS)
+        elif found:
             # An older StateCat command: upgrade the first, drop the rest.
             found[0][1]["command"] = HOOK_COMMAND
-            for group, hook in found[1:]:
-                group["hooks"].remove(hook)
+            if found[1:]:
+                _remove_hooks(settings, found[1:])
             message = "updated SessionStart hook in %s" % HOOK_SETTINGS
         else:
             settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(hook_entry())
@@ -2397,26 +2664,16 @@ def cmd_hook(args):
         if not found:
             print("no StateCat SessionStart hook in %s" % HOOK_SETTINGS)
             return 0
-        emptied = []
-        for group, hook in found:
-            group["hooks"].remove(hook)
-            if not group["hooks"]:
-                emptied.append(group)
-        hooks = settings["hooks"]
-        # Drop only groups this uninstall emptied, never ones the user left empty.
-        hooks["SessionStart"] = [
-            group for group in hooks["SessionStart"]
-            if not any(group is empty for empty in emptied)
-        ]
-        if not hooks["SessionStart"]:
-            del hooks["SessionStart"]
-        if not hooks:
-            del settings["hooks"]
+        _remove_hooks(settings, found)
         message = "removed SessionStart hook from %s" % HOOK_SETTINGS
     try:
-        write_hook_settings(path, settings)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as exc:
-        sys.stderr.write("error: could not write %s: %s\n" % (path, exc))
+        sys.stderr.write("error: could not create %s: %s\n" % (os.path.dirname(path), exc))
+        return 1
+    error = _write_if_unchanged(path, raw, dump_hook_settings(settings, raw))
+    if error:
+        sys.stderr.write("error: %s\n" % error)
         return 1
     print(message)
     return 0
@@ -3292,6 +3549,17 @@ def main(argv=None):
             return args.func(args)
     if args.command == "init":
         with project_lock(os.getcwd()):
+            return args.func(args)
+    # pointer and hook --install/--uninstall read, edit and replace
+    # AGENTS.md / CLAUDE.md / .claude/settings.json, so two of them at
+    # once could each read the old file and one would lose the
+    # other's change (SC-08, SC-14). They take the project lock; their
+    # writes also refuse when the file changed under them, for
+    # editors and Claude Code, which do not take the lock.
+    if args.command in ("pointer", "hook") and (
+        getattr(args, "install", False) or getattr(args, "uninstall", False)
+    ):
+        with project_lock(find_project_root() or os.getcwd()):
             return args.func(args)
     if args.command == "config" and getattr(args, "action", None) == "set":
         directory = require_root()

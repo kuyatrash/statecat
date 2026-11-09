@@ -964,6 +964,296 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "pointer", "--install", "--uninstall")
         self.assertNotEqual(result.returncode, 0)
 
+    # --- Pass 2 of the 2026-11-09 review: SC-08, SC-10..16, SC-18..20 ---
+    def _fake_bin(self, scripts):
+        """A folder of sh scripts named in `scripts`, for PATH tricks."""
+        bin_dir = os.path.join(self.dir, "fakebin")
+        os.makedirs(bin_dir, exist_ok=True)
+        for name, body in scripts.items():
+            path = os.path.join(bin_dir, name)
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        return re.sub(r"^([A-Za-z]):", lambda m: "/" + m.group(1).lower(), bin_dir.replace("\\", "/"))
+
+    def _run_hook(self, command, path_prefix=None):
+        script = command if path_prefix is None else 'PATH="%s:$PATH"; %s' % (path_prefix, command)
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_sc10_hook_reports_a_failed_show_and_still_runs_check(self):
+        # SC-10: `show && check; exit 0` meant a failed show skipped
+        # check and nothing said so. Both must run, and a failure
+        # must be reported in the output the agent sees.
+        self.init_project("Hook Fail")
+        shutil.copy(CLI, self.dir)
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        os.unlink(state_path(self.dir))
+        result = self._run_hook(command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("statecat hook: show failed", result.stdout)
+        self.assertIn("statecat hook: check failed", result.stdout)
+        # The tools' own error text reaches stdout too.
+        self.assertIn("STATE.md", result.stdout)
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_sc10_hook_reports_a_missing_statecat_command(self):
+        self.init_project("No Command")
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        empty = self._fake_bin({})
+        result = subprocess.run(
+            ["sh", "-c", 'PATH="%s:/usr/bin:/bin"; %s' % (empty, command)], capture_output=True, text=True,
+            env=dict(os.environ, CLAUDE_PROJECT_DIR=self.dir.replace("\\", "/")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("statecat hook: show failed", result.stdout)
+
+    @unittest.skipIf(shutil.which("sh") is None, "needs a POSIX sh to run the hook command")
+    def test_sc16_hook_skips_a_python_older_than_3_8(self):
+        # SC-16: the fallback only checked that an interpreter ran
+        # an empty program, which a Python 2 or 3.7 does. A python3
+        # that is too old must be skipped for the next candidate.
+        self.init_project("Old Python")
+        shutil.copy(CLI, self.dir)
+        run_cli(self.dir, "hook", "--install")
+        command = self.statecat_hook_commands()[0]
+        prefix = self._fake_bin({
+            # Runs an empty program, fails the version check, and
+            # would print a marker if it were used for StateCat.
+            "python3": 'case "$2" in "") exit 0;; *version_info*) exit 1;; esac\necho "OLD PYTHON USED"\nexit 1\n',
+            "py": "exit 127\n",
+            "python": 'exec "%s" "$@"\n' % sys.executable.replace("\\", "/"),
+        })
+        result = self._run_hook(command, prefix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("OLD PYTHON USED", result.stdout)
+        self.assertIn("# Project: Old Python", result.stdout)
+        self.assertIn("check: clean", result.stdout)
+
+    def test_sc15_hook_install_removes_an_old_hook_left_beside_the_current_one(self):
+        sys.path.insert(0, ROOT)
+        import statecat
+        self.init_project()
+        old = statecat.LEGACY_HOOK_COMMANDS[0]
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": statecat.HOOK_COMMAND}]},
+            {"hooks": [{"type": "command", "command": old}, {"type": "command", "command": "echo mine"}]},
+            {"hooks": [{"type": "command", "command": statecat.HOOK_COMMAND}]},
+        ]}}))
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed 2 duplicate or older StateCat hook(s)", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings["hooks"]["SessionStart"], [
+            {"hooks": [{"type": "command", "command": statecat.HOOK_COMMAND}]},
+            {"hooks": [{"type": "command", "command": "echo mine"}]},
+        ])
+        self.assertIn("already in", run_cli(self.dir, "hook", "--install").stdout)
+
+    def test_sc20_hook_install_keeps_the_files_own_formatting(self):
+        # SC-20: install used to rewrite the whole file with
+        # two-space indentation and \u-escaped non-ASCII text.
+        self.init_project()
+        original = (
+            '{\n'
+            '    "model": "café",\n'
+            '    "permissions": {\n'
+            '        "allow": [\n'
+            '            "Bash(ls)"\n'
+            '        ]\n'
+            '    }\n'
+            '}\n'
+        )
+        self.write_settings(original)
+        self.assertEqual(run_cli(self.dir, "hook", "--install").returncode, 0)
+        text = read_text(self.settings_path())
+        # Everything up to the end of "permissions" is unchanged,
+        # apart from the comma that now follows it.
+        self.assertTrue(text.startswith(original[: -len("    }\n}\n")] + "    },\n"), text)
+        self.assertIn('"model": "café"', text)
+        self.assertIn('\n    "hooks": {', text)
+        self.assertTrue(text.endswith("}\n"))
+        self.assertEqual(run_cli(self.dir, "hook", "--uninstall").returncode, 0)
+        self.assertEqual(read_text(self.settings_path()), original)
+
+    def test_sc20_hook_install_keeps_tabs_and_crlf(self):
+        self.init_project()
+        original = '{\r\n\t"model": "x"\r\n}\r\n'
+        self.write_settings(original)
+        self.assertEqual(run_cli(self.dir, "hook", "--install").returncode, 0)
+        raw = read_bytes(self.settings_path())
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        self.assertIn(b'\r\n\t"model": "x",\r\n\t"hooks"', raw)
+        self.assertEqual(run_cli(self.dir, "hook", "--uninstall").returncode, 0)
+        self.assertEqual(read_bytes(self.settings_path()), original.encode("utf-8"))
+
+    def test_sc08_hook_install_refuses_when_settings_change_underneath(self):
+        # SC-08: read, edit in memory, replace -- a change made by
+        # someone else in between (an editor, Claude Code itself)
+        # used to be silently overwritten.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        self.write_settings('{"model": "before"}\n')
+        changed = '{"model": "changed by someone else"}\n'
+        real_parse = statecat.parse_hook_settings
+
+        def parse_then_change(path, raw):
+            result = real_parse(path, raw)
+            self.write_settings(changed)
+            return result
+
+        class Args:
+            install, uninstall = True, False
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.dir)
+            with mock.patch.object(statecat, "parse_hook_settings", side_effect=parse_then_change):
+                with mock.patch("sys.stderr") as err:
+                    code = statecat.cmd_hook(Args())
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(code, 1)
+        self.assertIn("changed while StateCat was updating it", "".join(c.args[0] for c in err.write.call_args_list))
+        self.assertEqual(read_text(self.settings_path()), changed)
+
+    def _hold_lock(self):
+        sys.path.insert(0, ROOT)
+        import statecat
+        lock = statecat.project_lock(self.dir)
+        lock.__enter__()
+        return lock
+
+    def test_sc08_sc14_hook_and_pointer_writes_wait_for_the_project_lock(self):
+        self.init_project()
+        lock = self._hold_lock()
+        try:
+            env = {"STATECAT_LOCK_TIMEOUT": "0.5", "STATECAT_LOCK_STALE": "60"}
+            for args in (("hook", "--install"), ("pointer", "--uninstall"), ("pointer", "--install")):
+                result = run_cli_env(self.dir, env, *args)
+                self.assertEqual(result.returncode, 1, args)
+                self.assertIn("lock is held", result.stderr, args)
+            self.assertFalse(os.path.exists(self.settings_path()))
+            self.assertIn(POINTER, read_text(os.path.join(self.dir, "AGENTS.md")))
+        finally:
+            lock.__exit__(None, None, None)
+        self.assertEqual(run_cli(self.dir, "hook", "--install").returncode, 0)
+
+    def _symlink_or_skip(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest("cannot create symlinks here: %s" % exc)
+
+    def test_sc11_hook_install_refuses_a_settings_link_that_leaves_the_project(self):
+        self.init_project()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_settings = os.path.join(outside.name, "settings.json")
+        with open(outside_settings, "w", encoding="utf-8") as handle:
+            handle.write('{"model": "someone else"}\n')
+        self._symlink_or_skip(outside.name, os.path.join(self.dir, ".claude"))
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("outside this project", result.stderr)
+        self.assertEqual(read_text(outside_settings), '{"model": "someone else"}\n')
+
+    def test_sc11_pointer_refuses_a_link_that_leaves_the_project_but_allows_one_inside(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = os.path.join(outside.name, "AGENTS.md")
+        with open(outside_file, "w", encoding="utf-8") as handle:
+            handle.write("# Someone else's file\n")
+        self._symlink_or_skip(outside_file, os.path.join(self.dir, "AGENTS.md"))
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("outside this project", result.stderr)
+        self.assertEqual(read_text(outside_file), "# Someone else's file\n")
+        # A link inside the project (CLAUDE.md -> docs/agents.md) is fine.
+        os.unlink(os.path.join(self.dir, "AGENTS.md"))
+        os.makedirs(os.path.join(self.dir, "docs"))
+        inside = os.path.join(self.dir, "docs", "agents.md")
+        with open(inside, "w", encoding="utf-8") as handle:
+            handle.write("# Rules\n")
+        os.symlink(os.path.join("docs", "agents.md"), os.path.join(self.dir, "CLAUDE.md"))
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(POINTER, read_text(inside))
+
+    def test_sc12_pointer_uninstall_keeps_an_agents_md_statecat_did_not_create(self):
+        # SC-12: a user's own AGENTS.md that holds just the same
+        # header and the pointer used to be deleted.
+        agents = os.path.join(self.dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Project instructions\n\n%s\n" % POINTER)
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kept the file", result.stdout)
+        self.assertEqual(read_text(agents), "# Project instructions\n\n")
+
+    def test_sc13_pointer_quoted_in_docs_is_not_the_pointer(self):
+        # SC-13: install matched the pointer text anywhere, so a
+        # quote of it counted as installed; uninstall must also
+        # leave quotes alone.
+        agents = os.path.join(self.dir, "AGENTS.md")
+        quoted = (
+            "# Rules\n\nWe use StateCat; its pointer says \"%s\"\n\n"
+            "```text\n%s\n```\n" % (POINTER, POINTER)
+        )
+        with open(agents, "w", encoding="utf-8", newline="") as handle:
+            handle.write(quoted)
+        result = run_cli(self.dir, "pointer", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added pointer to AGENTS.md", result.stdout)
+        self.assertEqual(read_text(agents), quoted + POINTER + "\n")
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(read_text(agents), quoted)
+
+    def test_sc19_pointer_uninstall_exits_non_zero_when_a_file_cannot_be_read(self):
+        with open(os.path.join(self.dir, "AGENTS.md"), "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 \x80\n")
+        with open(os.path.join(self.dir, "CLAUDE.md"), "w", encoding="utf-8") as handle:
+            handle.write("# Rules\n%s\n" % POINTER)
+        result = run_cli(self.dir, "pointer", "--uninstall")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not read", result.stderr)
+        # The readable file is still processed.
+        self.assertIn("removed pointer from CLAUDE.md", result.stdout)
+        self.assertEqual(read_text(os.path.join(self.dir, "CLAUDE.md")), "# Rules\n")
+
+    def test_sc18_tilde_and_longer_fences_are_not_structure(self):
+        # SC-18: only ``` fences were recognised, and any ``` line
+        # toggled the fence, so a ~~~ block or a ```` block showing
+        # a ``` line let its example headings and items be parsed.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Real item")
+        text = read_text(state_path(self.dir))
+        fences = (
+            "~~~markdown\n## Open\n- #99 [2026-11-06] Tilde fake\n~~~\n\n"
+            "````markdown\n```\n## Open\n- #98 [2026-11-06] Long-fence fake\n```\n````\n\n"
+            "```markdown\n~~~\n## Open\n- #97 [2026-11-06] Mixed fake\n~~~\n```\n\n"
+        )
+        text = text.replace("## Decided\n", fences + "## Decided\n", 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("clean", result.stdout)
+        shown = run_cli(self.dir, "show", "--json").stdout
+        for fake in ("#99", "#98", "#97", "fake"):
+            self.assertNotIn(fake, shown)
+        self.assertEqual(run_cli(self.dir, "add", "Open", "Second").returncode, 0)
+        self.assertIn("Second", "\n".join(bucket_lines(read_text(state_path(self.dir)), "Open")))
+
     def test_non_ascii_output_survives_a_non_utf8_stdout(self):
         # Windows pipes default to the ANSI code page; cp1252 forces that anywhere.
         self.init_project()
@@ -1154,7 +1444,7 @@ class StateCatTest(unittest.TestCase):
         commands = self.statecat_hook_commands()
         self.assertEqual(len(commands), 1)
         self.assertIn('cd "$CLAUDE_PROJECT_DIR"', commands[0])
-        self.assertIn("P=py", commands[0])
+        self.assertIn("for P in python3 py python", commands[0])
         self.assertTrue(commands[0].endswith("exit 0"))
 
     def test_hook_install_keeps_existing_settings_and_is_idempotent(self):
