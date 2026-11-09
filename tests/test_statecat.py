@@ -1190,6 +1190,55 @@ class StateCatTest(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertNotEqual(commands[0], old)
 
+    def test_sc09_hook_install_keeps_a_users_wrapper_command(self):
+        # SC-09: a user's own command that merely contains
+        # "statecat.py show" and "statecat.py check" is not a
+        # StateCat hook. Install must add StateCat's entry next to
+        # it, not overwrite it.
+        self.init_project()
+        mine = 'cd "$CLAUDE_PROJECT_DIR" && ./my-wrapper.sh "statecat.py show" "statecat.py check" && notify-me'
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": mine}]},
+        ]}}))
+        result = run_cli(self.dir, "hook", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("added SessionStart hook", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        commands = [h["command"] for g in settings["hooks"]["SessionStart"] for h in g["hooks"]]
+        self.assertIn(mine, commands)
+        self.assertEqual(len(commands), 2)
+
+    def test_sc09_hook_uninstall_keeps_a_users_wrapper_command(self):
+        self.init_project()
+        mine = "python3 statecat.py show && python3 statecat.py check && ./post-to-slack.sh"
+        self.write_settings(json.dumps({"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": mine}]},
+        ]}}))
+        result = run_cli(self.dir, "hook", "--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no StateCat SessionStart hook", result.stdout)
+        settings = json.loads(read_text(self.settings_path()))
+        self.assertEqual(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], mine)
+
+    def test_sc09_every_shipped_hook_command_is_still_recognised(self):
+        # Exact matching must still upgrade and remove every
+        # command StateCat itself wrote or documented.
+        sys.path.insert(0, ROOT)
+        import statecat
+        for old in statecat.LEGACY_HOOK_COMMANDS:
+            self.init_project() if not os.path.exists(state_path(self.dir)) else None
+            self.write_settings(json.dumps({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "  %s\n" % old}]},
+            ]}}))
+            result = run_cli(self.dir, "hook", "--install")
+            self.assertIn("updated SessionStart hook", result.stdout, old)
+            self.assertEqual(self.statecat_hook_commands(), [statecat.HOOK_COMMAND])
+            self.write_settings(json.dumps({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": old}]},
+            ]}}))
+            result = run_cli(self.dir, "hook", "--uninstall")
+            self.assertIn("removed SessionStart hook", result.stdout, old)
+
     def test_hook_install_refuses_invalid_json(self):
         self.init_project()
         self.write_settings('{"hooks": {,}')
@@ -1693,10 +1742,11 @@ class StateCatTest(unittest.TestCase):
         # The exact interleaving ChatGPT flagged: a writer's release
         # checks ownership, a takeover happens, then the release
         # deletes. The old check-then-delete code lost the new
-        # owner's lock here. The fix renames the dir aside first,
-        # so the takeover is injected between the rename and the
-        # token check on the renamed copy, and the new owner's
-        # lock must survive.
+        # owner's lock here. Release checks the token in place,
+        # renames the dir aside, then verifies the renamed copy,
+        # so the takeover is injected at that last read (the
+        # first read of a dir other than the lock path), and the
+        # new owner's lock must survive.
         self.init_project()
         sys.path.insert(0, ROOT)
         import statecat
@@ -1713,7 +1763,7 @@ class StateCatTest(unittest.TestCase):
             real_read = statecat.project_lock._read_owner_token_from
 
             def injected_read(self, directory):
-                if "second" not in holder:
+                if "second" not in holder and directory != lock_path:
                     second = statecat.project_lock(test_dir)
                     second.__enter__()
                     holder["second"] = second
@@ -1801,6 +1851,177 @@ class StateCatTest(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def _with_lock_env(self, env, body):
+        old_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            body()
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_sc17_waiter_never_moves_a_live_owners_lock(self):
+        # SC-17: a waiter that found an old-looking lock used to
+        # rename it aside *before* checking whether its owner was
+        # alive, then put it back. While it was aside the lock path
+        # was empty, so a third process could mkdir it and become a
+        # second writer next to the still-running owner. The
+        # abandonment check must run in place: a lock whose owner
+        # is alive is never moved, not even briefly.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+
+        def body():
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            # Past the 1s stale limit, under the 10x unknown-owner
+            # threshold: old enough to trigger a break attempt, but
+            # the owner (this process) is alive.
+            old = time.time() - 5
+            os.utime(lock_path, (old, old))
+            moved = []
+            real_rename = os.rename
+
+            def recording_rename(src, dst, *args, **kwargs):
+                if os.path.abspath(src) == os.path.abspath(lock_path):
+                    moved.append(dst)
+                return real_rename(src, dst, *args, **kwargs)
+
+            with mock.patch.object(statecat.os, "rename", side_effect=recording_rename):
+                second = statecat.project_lock(self.dir)
+                with self.assertRaises(SystemExit):
+                    second.__enter__()
+            self.assertEqual(moved, [], "a live owner's lock was moved off its path")
+            self.assertIn(first.owner_token, read_text(os.path.join(lock_path, "owner")))
+            first.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+
+        self._with_lock_env({"STATECAT_LOCK_TIMEOUT": "1", "STATECAT_LOCK_STALE": "1"}, body)
+
+    def test_sc17_moved_copy_that_is_not_the_checked_lock_is_restored(self):
+        # The lock is only deleted when the renamed copy is the
+        # very directory that was proved abandoned. Here the
+        # abandoned lock is swapped for a live writer's lock right
+        # before the rename; the moved copy must go back to the
+        # lock path, never be deleted.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+
+        def body():
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            simulate_dead_owner(lock_path)
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            real_rename = os.rename
+            swapped = {}
+
+            def swapping_rename(src, dst, *args, **kwargs):
+                if not swapped and os.path.abspath(src) == os.path.abspath(lock_path):
+                    shutil.rmtree(lock_path)
+                    os.mkdir(lock_path)
+                    with open(os.path.join(lock_path, "owner"), "w", encoding="utf-8") as handle:
+                        handle.write("pid=%d time=x\nstart=unknown\ntoken=intruder\n" % os.getpid())
+                    swapped["done"] = True
+                return real_rename(src, dst, *args, **kwargs)
+
+            with mock.patch.object(statecat.os, "rename", side_effect=swapping_rename):
+                second = statecat.project_lock(self.dir)
+                with self.assertRaises(SystemExit):
+                    second.__enter__()
+            self.assertTrue(swapped)
+            self.assertIn("token=intruder", read_text(os.path.join(lock_path, "owner")))
+            shutil.rmtree(lock_path)
+
+        self._with_lock_env({"STATECAT_LOCK_TIMEOUT": "1", "STATECAT_LOCK_STALE": "1"}, body)
+
+    def test_sc17_breakers_are_serialised_by_the_break_guard(self):
+        # While another process holds the break guard, a waiter
+        # must not break even a provably abandoned lock; once the
+        # guard is free, it does.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        statecat_dir = os.path.join(self.dir, ".statecat")
+
+        def body():
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            simulate_dead_owner(lock_path)
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            guard = statecat._acquire_break_guard(statecat_dir, time.monotonic() + 1)
+            self.assertNotIn(guard, (None, statecat._BREAK_GUARD_UNSUPPORTED))
+            try:
+                second = statecat.project_lock(self.dir)
+                with self.assertRaises(SystemExit):
+                    second.__enter__()
+                self.assertIn(first.owner_token, read_text(os.path.join(lock_path, "owner")))
+            finally:
+                statecat._release_break_guard(guard)
+            third = statecat.project_lock(self.dir)
+            third.__enter__()
+            self.assertIn(third.owner_token, read_text(os.path.join(lock_path, "owner")))
+            third.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+            # The guard file is a plain lockable file and stays.
+            self.assertTrue(os.path.isfile(os.path.join(statecat_dir, "lock.break")))
+
+        self._with_lock_env({"STATECAT_LOCK_TIMEOUT": "1", "STATECAT_LOCK_STALE": "1"}, body)
+
+    def test_sc17_release_never_moves_a_lock_that_is_not_ours(self):
+        # A writer whose lock was broken and taken over must not
+        # rename the new owner's lock aside on release: even a
+        # brief move leaves the path open to a third writer.
+        self.init_project()
+        sys.path.insert(0, ROOT)
+        import statecat
+        from unittest import mock
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+
+        def body():
+            first = statecat.project_lock(self.dir)
+            first.__enter__()
+            first._stop_heartbeat()
+            simulate_dead_owner(lock_path)
+            old = time.time() - 3600
+            os.utime(lock_path, (old, old))
+            second = statecat.project_lock(self.dir)
+            second.__enter__()
+            moved = []
+            real_rename = os.rename
+
+            def recording_rename(src, dst, *args, **kwargs):
+                if os.path.abspath(src) == os.path.abspath(lock_path):
+                    moved.append(dst)
+                return real_rename(src, dst, *args, **kwargs)
+
+            with mock.patch.object(statecat.os, "rename", side_effect=recording_rename):
+                first.__exit__(None, None, None)
+            self.assertEqual(moved, [])
+            self.assertIn(second.owner_token, read_text(os.path.join(lock_path, "owner")))
+            second.__exit__(None, None, None)
+            self.assertFalse(os.path.isdir(lock_path))
+
+        self._with_lock_env({"STATECAT_LOCK_TIMEOUT": "5", "STATECAT_LOCK_STALE": "1"}, body)
 
     def test_lock_acquisition_fails_when_owner_file_cannot_be_written(self):
         # A writer that cannot record its owner token must fail

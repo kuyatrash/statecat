@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Breaking a stale lock can no longer create two writers (SC-17). A
+  waiter used to rename an old-looking lock aside *before* checking
+  whether its owner was alive, then put it back; while it was aside
+  the lock path was empty, and a third process could take it next to
+  the still-running owner. The abandonment check now runs with the
+  lock still in place, so a live owner's lock is never moved, and
+  the renamed copy is only deleted if it is the very directory that
+  was checked. Stale breaking and release are serialised by an OS
+  lock on `.statecat/lock.break`, which the kernel drops if its
+  holder dies, so it can never go stale itself. Release checks its
+  token in place too, and never moves a lock that is no longer its
+  own.
+- `hook --install` and `hook --uninstall` recognise a StateCat hook
+  only by an exact command StateCat has shipped (SC-09). A user's own
+  command or wrapper that merely contains `statecat.py show` and
+  `statecat.py check` used to be replaced by install or deleted by
+  uninstall; it is now left alone.
 - `init` with a blank project name uses the folder name, as when the
   name is omitted, instead of writing an empty `# Project:` header;
   surrounding spaces in a name are trimmed.
