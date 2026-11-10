@@ -14,7 +14,7 @@
 - #3 [2026-10-26] Choose the final stall sign design.
 
 ## Waiting on others
-- #4 [2026-10-26] Wait for the flour supplier delivery.
+- #4 [2026-10-26] Wait for the flour supplier delivery, resolves when the supplier confirms a date [review 2026-11-09]
 
 ## Parked
 - #5 [2026-10-20] Winter market stall - do not raise until the owner reopens it.

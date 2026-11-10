@@ -1686,7 +1686,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.4.0"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.5.0"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
@@ -3332,6 +3332,292 @@ class StateCatTest(unittest.TestCase):
         result = run_cli(self.dir, "add", "Open", "x")
         self.assert_clean_failure(result)
         self.assertIn("must be a folder", result.stderr)
+
+    # 1.5.0: last-check receipt
+    def receipt(self):
+        path = os.path.join(self.dir, ".statecat", "last-check.json")
+        if not os.path.exists(path):
+            return None
+        return json.loads(read_text(path))
+
+    def status_line(self, prefix):
+        result = run_cli(self.dir, "status")
+        for line in result.stdout.splitlines():
+            if line.startswith(prefix):
+                return line
+        return None
+
+    def test_check_writes_receipt_with_hashes(self):
+        import hashlib
+        self.init_project()
+        self.assertIsNone(self.receipt())
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = self.receipt()
+        self.assertEqual(receipt["result"], "clean")
+        self.assertEqual(receipt["problems"], 0)
+        self.assertEqual(receipt["version"], "1.5.0")
+        self.assertEqual(
+            receipt["state_sha256"],
+            hashlib.sha256(read_bytes(state_path(self.dir))).hexdigest(),
+        )
+        self.assertEqual(
+            receipt["archive_sha256"],
+            hashlib.sha256(read_bytes(archive_path(self.dir))).hexdigest(),
+        )
+
+    def test_check_receipt_records_warnings_and_problems(self):
+        self.init_project()
+        with open(state_path(self.dir), "a", encoding="utf-8") as handle:
+            handle.write("- no id or date\n")
+        run_cli(self.dir, "check")
+        self.assertEqual(self.receipt()["result"], "warnings")
+        with open(state_path(self.dir), "a", encoding="utf-8") as handle:
+            handle.write("## Bogus\n")
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.receipt()["result"], "problems")
+
+    def test_check_fix_receipt_describes_fixed_file(self):
+        import hashlib
+        self.init_project()
+        with open(state_path(self.dir), "a", encoding="utf-8") as handle:
+            handle.write("- no id or date\n")
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.receipt()["state_sha256"],
+            hashlib.sha256(read_bytes(state_path(self.dir))).hexdigest(),
+        )
+
+    def test_status_reports_last_check_age_and_changes(self):
+        self.init_project()
+        self.assertEqual(self.status_line("Last check:"), "Last check: never recorded")
+        run_cli(self.dir, "check")
+        line = self.status_line("Last check:")
+        self.assertIn("clean", line)
+        self.assertIn("files unchanged since", line)
+        run_cli(self.dir, "add", "Open", "x")
+        self.assertIn("STATE.md changed since", self.status_line("Last check:"))
+
+    def test_status_and_show_do_not_write_receipt(self):
+        self.init_project()
+        run_cli(self.dir, "status")
+        run_cli(self.dir, "show")
+        run_cli(self.dir, "show", "--json")
+        self.assertIsNone(self.receipt())
+
+    def test_corrupt_receipt_reads_as_never_recorded(self):
+        self.init_project()
+        os.makedirs(os.path.join(self.dir, ".statecat"), exist_ok=True)
+        with open(os.path.join(self.dir, ".statecat", "last-check.json"), "w") as handle:
+            handle.write("{not json")
+        result = run_cli(self.dir, "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Last check: never recorded", result.stdout)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.receipt()["result"], "clean")
+
+    def test_unwritable_receipt_is_a_note_not_a_failure(self):
+        self.init_project()
+        receipt_path = os.path.join(self.dir, ".statecat", "last-check.json")
+        os.makedirs(receipt_path)  # a folder where the file must go
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("check: clean", result.stdout)
+        self.assertIn("note: could not record this check", result.stderr)
+
+    def test_show_json_includes_last_check(self):
+        self.init_project()
+        data = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        self.assertIsNone(data["last_check"])
+        run_cli(self.dir, "check")
+        data = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        self.assertEqual(data["last_check"]["result"], "clean")
+        self.assertFalse(data["last_check"]["files_changed_since"])
+
+    # 1.5.0: review dates on waiting items
+    def future(self, days):
+        from datetime import timedelta
+        return (date.today() + timedelta(days=days)).isoformat()
+
+    def test_add_waiting_with_review_and_resolves_when(self):
+        self.init_project()
+        result = run_cli(
+            self.dir, "add", "others", "Wait for supplier",
+            "--resolves-when", "they confirm a date", "--review", "3d",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = bucket_lines(read_text(state_path(self.dir)), "Waiting on others")
+        self.assertEqual(
+            lines,
+            ["- #1 [%s] Wait for supplier, resolves when they confirm a date [review %s]"
+             % (TODAY, self.future(3))],
+        )
+        data = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        item = data["buckets"]["Waiting on others"][0]
+        self.assertEqual(item["review"], self.future(3))
+        self.assertTrue(item["resolves_when"])
+        self.assertEqual(item["rechecks"], 0)
+
+    def test_review_option_validation(self):
+        self.init_project()
+        before = read_bytes(state_path(self.dir))
+        for args in (
+            ("add", "others", "x", "--review", "2001-01-01"),
+            ("add", "others", "x", "--review", "2030-02-30"),
+            ("add", "others", "x", "--review", "soon"),
+            ("add", "open", "x", "--review", "3d"),
+            ("add", "decided", "x", "--resolves-when", "y"),
+            ("add", "others", "x", "--resolves-when", ""),
+            ("add", "others", "x [review %s]" % self.future(2), "--review", "3d"),
+        ):
+            result = run_cli(self.dir, *args)
+            self.assertEqual(result.returncode, 1, args)
+            self.assertIn("error:", result.stderr)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
+        result = run_cli(self.dir, "add", "human", "x", "--review", TODAY)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_due_review_replaces_stale_rule(self):
+        self.init_project()
+        with open(state_path(self.dir), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            "## Waiting on others\n",
+            "## Waiting on others\n"
+            "- #1 [2020-01-01] Old but not due [review %s]\n"
+            "- #2 [2020-01-01] Old and due [review 2020-02-01]\n"
+            "- #3 [2020-01-01] Old with no review\n" % self.future(5),
+        ).replace("> Last ID used: #0", "> Last ID used: #3")
+        with open(state_path(self.dir), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("#1", result.stdout)
+        self.assertIn("due: #2 in Waiting on others reached its review date 2020-02-01", result.stdout)
+        self.assertNotIn("stale: #2", result.stdout)
+        self.assertIn("stale: #3 in Waiting on others", result.stdout)
+        status = run_cli(self.dir, "status").stdout
+        self.assertIn("Waiting items due for review: 1", status)
+        self.assertIn("Stale waiting items: 1", status)
+        self.assertIn("Longest wait: #1", status)
+
+    def test_review_marker_warnings(self):
+        self.init_project()
+        with open(state_path(self.dir), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            "## Open\n",
+            "## Open\n- #1 [%s] Not waiting [review %s]\n" % (TODAY, self.future(3)),
+        ).replace(
+            "## Waiting on human\n",
+            "## Waiting on human\n"
+            "- #2 [%s] Bad date [review 2030-02-30]\n"
+            "- #3 [%s] Before itself [review 2020-01-01]\n"
+            "- #4 [%s] Marker [review %s] mid-line is text\n"
+            % (TODAY, TODAY, TODAY, self.future(1)),
+        ).replace("> Last ID used: #0", "> Last ID used: #4")
+        with open(state_path(self.dir), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        out = run_cli(self.dir, "check").stdout
+        self.assertIn("warning: #1 in Open has a review date", out)
+        self.assertIn("warning: #2 in Waiting on human has an invalid review date", out)
+        self.assertIn("warning: #3 in Waiting on human has a review date 2020-01-01 before its own date", out)
+        self.assertIn("due: #3", out)
+        self.assertNotIn("#4", out)
+
+    def test_recheck_sets_review_and_keeps_start_date(self):
+        self.init_project()
+        with open(state_path(self.dir), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            "## Waiting on others\n",
+            "## Waiting on others\n- #1 [2026-01-05] Wait for supplier [review 2026-01-20]\n",
+        ).replace("> Last ID used: #0", "> Last ID used: #1")
+        with open(state_path(self.dir), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "recheck", "1", "--review", "7d", "--because", "supplier says next week")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deferred 1 time)", result.stdout)
+        result = run_cli(self.dir, "recheck", "#1", "--review", TODAY, "--because", "holiday")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deferred 2 times", result.stdout)
+        text = read_text(state_path(self.dir))
+        self.assertIn(
+            "- #1 [2026-01-05] Wait for supplier [review %s]\n"
+            "  - %s still waiting: supplier says next week\n"
+            "  - %s still waiting: holiday\n" % (TODAY, TODAY, TODAY),
+            text,
+        )
+        out = run_cli(self.dir, "check").stdout
+        self.assertIn("due: #1 in Waiting on others reached its review date %s, deferred 2 times" % TODAY, out)
+        data = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        self.assertEqual(data["buckets"]["Waiting on others"][0]["rechecks"], 2)
+
+    def test_recheck_rejections(self):
+        self.init_project()
+        run_cli(self.dir, "add", "open", "Not waiting")
+        run_cli(self.dir, "add", "others", "Waiting")
+        before = read_bytes(state_path(self.dir))
+        for args in (
+            ("recheck", "1", "--review", "3d", "--because", "x"),
+            ("recheck", "2", "--review", "3d"),
+            ("recheck", "2", "--review", "3d", "--because", "  "),
+            ("recheck", "2", "--review", "2001-01-01", "--because", "x"),
+            ("recheck", "2", "--because", "x"),
+            ("recheck", "9", "--review", "3d", "--because", "x"),
+        ):
+            result = run_cli(self.dir, *args)
+            self.assertNotEqual(result.returncode, 0, args)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
+
+    def test_update_keeps_review_marker(self):
+        self.init_project()
+        run_cli(self.dir, "add", "others", "Wait", "--review", "4d")
+        result = run_cli(self.dir, "update", "1", "Wait for the supplier")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kept review date", result.stdout)
+        self.assertIn(
+            "Wait for the supplier [review %s]" % self.future(4),
+            read_text(state_path(self.dir)),
+        )
+        run_cli(self.dir, "update", "1", "Reworded [review %s]" % self.future(9))
+        self.assertIn("Reworded [review %s]" % self.future(9), read_text(state_path(self.dir)))
+
+    def test_move_drops_and_sets_review(self):
+        self.init_project()
+        run_cli(self.dir, "add", "others", "Wait", "--review", "4d")
+        run_cli(self.dir, "recheck", "1", "--review", "6d", "--because", "slow")
+        result = run_cli(self.dir, "move", "1", "decided")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dropped review date %s" % self.future(6), result.stdout)
+        text = read_text(state_path(self.dir))
+        self.assertEqual(bucket_lines(text, "Decided"), ["- #1 [%s] Wait" % TODAY])
+        self.assertIn("  - %s still waiting: slow" % TODAY, text)
+        result = run_cli(self.dir, "move", "1", "human", "--review", "2d", "--resolves-when", "owner picks")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            bucket_lines(read_text(state_path(self.dir)), "Waiting on human"),
+            ["- #1 [%s] Wait, resolves when owner picks [review %s]" % (TODAY, self.future(2))],
+        )
+        result = run_cli(self.dir, "move", "1", "others", "--resolves-when", "again")
+        self.assertEqual(result.returncode, 1)
+        result = run_cli(self.dir, "move", "1", "open", "--review", "2d")
+        self.assertEqual(result.returncode, 1)
+
+    def test_untouched_review_lines_stay_byte_identical(self):
+        self.init_project()
+        with open(state_path(self.dir), "r", encoding="utf-8", newline="") as handle:
+            text = handle.read()
+        line = "- #1 [2026-01-05] Odd   spacing,  resolves when X   [review 2026-01-20]  \r\n"
+        text = text.replace("## Waiting on others\n", "## Waiting on others\n" + line)
+        text = text.replace("> Last ID used: #0", "> Last ID used: #1")
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        run_cli(self.dir, "add", "open", "other item")
+        self.assertIn(line, read_text(state_path(self.dir)))
 
 
 if __name__ == "__main__":

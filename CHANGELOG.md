@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.5.0 — 2026-11-10
+
+Two additions from the Moltbook feedback review: a record of when
+`check` last ran, and review dates for waiting items. Upgrading
+needs no action: old files parse unchanged, and a waiting item with
+no review date keeps the 14-day stale rule. `.statecat/` gains
+`last-check.json`, covered by the existing gitignore line.
+
+- `check` (and `check --fix`, after its fix) overwrites
+  `.statecat/last-check.json` with the time, result, and a sha256
+  of both state files. A clean check used to leave no trace, so a
+  file checked an hour ago looked the same as one never checked.
+  `status` prints `Last check: <time>, <result>, <age>, files
+  unchanged since` (or which file changed since), and
+  `show --json` has a `last_check` object. It records a structural
+  check, not that the entries are still true. A receipt that cannot
+  be written is a note on stderr, never a failure. The receipt
+  stays out of STATE.md so `check` does not rewrite the file, and
+  churn its history and backups, every session.
+- Waiting items can carry `, resolves when ...` and a trailing
+  `[review YYYY-MM-DD]`. `add` and `move` take `--resolves-when`
+  and `--review` (a date or `Nd`) for waiting buckets only.
+  `check` reports an item as `due:` from its review date on, and
+  does not flag it as stale before then. It warns on an invalid
+  review date, one before the item's own date, or a review date
+  on a non-waiting item.
+- New `recheck ID --review DATE --because TEXT` records "still
+  waiting": it moves the review date and adds a dated note under
+  the item, keeping the date the wait started (`update` re-stamps
+  it). `--because` is required. A due item that has been rechecked
+  says how many times it was deferred.
+- `update` keeps a waiting item's review date unless the new
+  wording has its own; `move` out of a waiting bucket drops it and
+  says so.
+- `status` adds `Waiting items due for review` and `Longest wait`.
+  `show --json` waiting items add `review`, `resolves_when` and
+  `rechecks`.
+
 ## 1.4.0 — 2026-11-09
 
 Safety release after v1.3.0: the stale-lock takeover race (SC-17) and

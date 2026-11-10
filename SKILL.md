@@ -123,6 +123,19 @@ is calling it, and a hand edit bypasses it entirely.
 - The session-start `check` report counts as that one mention.
 - Stale-item flags from `check` are information for the owner, not
   a prompt for the agent to chase the item.
+- When you add a waiting item, add what resolves it and when to
+  look again if you know them:
+  `add others "Flour delivery" --resolves-when "the supplier confirms a date" --review 14d`.
+  Never invent a review date the owner did not imply.
+- A `due:` line from `check` means the review date arrived. The
+  item gets resolved (`move`), raised with the owner once, or put
+  off with `recheck ID --review DATE --because TEXT`. Use
+  `recheck`, not `update`, for "still waiting": it keeps the date
+  the wait started. Never take an action because a review date
+  passed.
+- `status` shows when `check` last ran and whether the files
+  changed since. Read it as an age, not a guarantee the entries are
+  still true.
 - A date marked with an asterisk, for example [2026-10-26*], is an
   assigned date from `check --fix`. Its age is unknown, not fresh:
   never treat it as fresh, and never use it to flag or clear

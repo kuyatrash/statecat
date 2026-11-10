@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.4.0: one living project state, readable by any agent in one read.
+"""StateCat v1.5.0: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -51,6 +51,16 @@ Rules implemented here (StateCat scope, revision 5):
   stamps an assigned date marked with an asterisk, e.g. [2026-10-26*].
   A starred date means age unknown: check never treats it as fresh
   and never uses it to flag or clear staleness.
+- A waiting item may end its first line with [review YYYY-MM-DD]
+  and say ", resolves when ...". On or after that date check
+  reports it as due (a warning, never a reason to block a write);
+  until then it is never flagged as stale. `recheck` moves the
+  review date and adds a dated "still waiting" continuation line,
+  keeping the item's own date (when the wait started). StateCat
+  only reports a due item; it never acts on one.
+- Every `check` overwrites .statecat/last-check.json (time,
+  result, sha256 of both files), which `status` reports as an age.
+  It records a structural check, not that the entries are true.
 - Every write is backed up first as a paired snapshot of both
   files. Two-file writes (supersede, archive) write the archive
   first, then STATE.md, each file atomically (temp file, then
@@ -69,6 +79,7 @@ Rules implemented here (StateCat scope, revision 5):
 
 import argparse
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -80,9 +91,9 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -189,6 +200,41 @@ def split_ending(line):
     return line, ""
 
 
+WAITING_BUCKETS = ("Waiting on human", "Waiting on others")
+# A waiting item's review date: "[review YYYY-MM-DD]" as the last
+# thing on its first line. Anywhere else it is ordinary text.
+REVIEW_MARKER_RE = re.compile(r"\s*\[review ([0-9]{4}-[0-9]{2}-[0-9]{2})\]\s*$")
+RESOLVES_WHEN_RE = re.compile(r"\bresolves when\b", re.IGNORECASE)
+# A recheck note: an indented continuation line written by `recheck`.
+RECHECK_LINE_RE = re.compile(r"^\s+- [0-9]{4}-[0-9]{2}-[0-9]{2} still waiting\b")
+
+
+def review_marker(text):
+    """Split item text into (text without the review marker, review
+    date string or None)."""
+    match = REVIEW_MARKER_RE.search(text)
+    if match is None:
+        return text, None
+    return text[:match.start()], match.group(1)
+
+
+def with_review(text, review):
+    """Item text with its review marker set to `review` (or removed
+    when review is None)."""
+    base, _old = review_marker(text)
+    if review is None:
+        return base
+    return "%s [review %s]" % (base, review)
+
+
+def recheck_count(state, item):
+    """How many `recheck` notes sit under an item."""
+    return sum(
+        1 for index in item.continuation_indices
+        if RECHECK_LINE_RE.match(state.lines[index][0])
+    )
+
+
 class Item:
     """One '- ...' line in a state file."""
 
@@ -204,6 +250,21 @@ class Item:
         self.text = ""
         self.continuation_indices = []
         self.parse()
+
+    @property
+    def review_date(self):
+        """The [review YYYY-MM-DD] date at the end of the item's first
+        line, or None. Read-only: text and render() are unchanged."""
+        return review_marker(self.text)[1]
+
+    @property
+    def review_invalid(self):
+        review = self.review_date
+        return review is not None and not _valid_date(review)
+
+    @property
+    def has_resolves_when(self):
+        return RESOLVES_WHEN_RE.search(self.text) is not None
 
     def parse(self):
         body = self.content
@@ -683,10 +744,60 @@ def warnings_for(state, archive, directory=None):
             "budget %d lines / %d bytes)"
             % (STATE, line_count, size, config["size_lines"], config["size_bytes"])
         )
-    # Stale waiting items: unstarred dates older than the configured days.
+    # Review dates. Only waiting items use one; a waiting item with a
+    # valid review date is judged by that date instead of its age.
     today = date.today()
+    reviewed = set()
     for item in state.items:
-        if item.bucket not in ("Waiting on human", "Waiting on others"):
+        review = item.review_date
+        if review is None:
+            continue
+        label = "#%s" % (item.item_id if item.item_id is not None else "?")
+        if item.bucket not in WAITING_BUCKETS:
+            warnings.append(
+                "warning: %s in %s has a review date [review %s]; "
+                "only waiting items use one" % (label, item.bucket, review)
+            )
+            continue
+        if item.review_invalid:
+            warnings.append(
+                "warning: %s in %s has an invalid review date [review %s]; "
+                "it is not a real calendar date, so it is ignored"
+                % (label, item.bucket, review)
+            )
+            continue
+        review_day = date(*(int(part) for part in review.split("-")))
+        if (
+            item.item_date is not None
+            and not item.date_invalid
+            and not item.starred
+            and review < item.item_date
+        ):
+            warnings.append(
+                "warning: %s in %s has a review date %s before its own date %s"
+                % (label, item.bucket, review, item.item_date)
+            )
+        reviewed.add(item.line_index)
+        if review_day > today:
+            continue
+        rechecks = recheck_count(state, item)
+        deferred = ""
+        if rechecks:
+            deferred = ", deferred %d time%s" % (rechecks, "" if rechecks == 1 else "s")
+        if item.bucket == "Waiting on human":
+            note = "owner only, not a prompt to chase; move, archive, or recheck it"
+        else:
+            note = "not a prompt to chase; move, archive, or recheck it"
+        warnings.append(
+            "due: %s in %s reached its review date %s%s (%s)"
+            % (label, item.bucket, review, deferred, note)
+        )
+    # Stale waiting items: unstarred dates older than the configured
+    # days, for waiting items with no (valid) review date.
+    for item in state.items:
+        if item.bucket not in WAITING_BUCKETS:
+            continue
+        if item.line_index in reviewed:
             continue
         age = item_age_days(item, today)
         if age is None or age <= config["stale_days"]:
@@ -2697,6 +2808,10 @@ def item_to_dict(item, parsed=None):
     if parsed is not None:
         # Hand-wrapped lines, stripped, so JSON readers see the whole item.
         data["continuation"] = [parsed.lines[index][0].strip() for index in item.continuation_indices]
+    if item.bucket in WAITING_BUCKETS:
+        data["review"] = item.review_date
+        data["resolves_when"] = item.has_resolves_when
+        data["rechecks"] = recheck_count(parsed, item) if parsed is not None else 0
     return data
 
 
@@ -2714,6 +2829,7 @@ def cmd_show(args):
         data = {
             "project": project_name(state),
             "last_id": state.last_id,
+            "last_check": check_receipt_json(directory),
             "buckets": {
                 bucket: [item_to_dict(item, state) for item in state.items if item.bucket == bucket]
                 for bucket in buckets
@@ -2744,6 +2860,8 @@ def cmd_status(args):
     problems = structural_problems(state, archive)
     warnings = warnings_for(state, archive, directory)
     stale = [warning for warning in warnings if warning.startswith("stale:")]
+    due = [warning for warning in warnings if warning.startswith("due:")]
+    receipt = read_check_receipt(directory)
     counts = {bucket: 0 for bucket in BUCKETS}
     for item in state.items:
         if item.bucket in counts:
@@ -2751,9 +2869,20 @@ def cmd_status(args):
     print("StateCat status: %s" % (project_name(state) or "Unnamed project"))
     print(", ".join("%s: %d" % (bucket, counts[bucket]) for bucket in BUCKETS))
     print("Archived: %d" % len(archive.items))
+    if due:
+        print("Waiting items due for review: %d" % len(due))
     if stale:
         print("Stale waiting items: %d" % len(stale))
+    longest = None
+    for item in state.items:
+        if item.bucket in WAITING_BUCKETS and item.item_id is not None:
+            age = item_age_days(item)
+            if age is not None and (longest is None or age > longest[1]):
+                longest = (item.item_id, age)
+    if longest is not None:
+        print("Longest wait: #%d, %d day%s" % (longest[0], longest[1], "" if longest[1] == 1 else "s"))
     print("Last ID used: #%s" % (state.last_id if state.last_id is not None else "?"))
+    print(describe_check_receipt(directory, receipt))
     try:
         size = os.path.getsize(os.path.join(directory, STATE))
     except OSError:
@@ -2882,6 +3011,45 @@ def insert_into_bucket(state, bucket, line_content):
     return index
 
 
+def parse_review_arg(text):
+    """A --review value as a YYYY-MM-DD string: a real calendar date,
+    or Nd for N days from today. Past dates are rejected."""
+    raw = (text or "").strip()
+    match = re.match(r"^([0-9]{1,5})d$", raw)
+    if match:
+        return (date.today() + timedelta(days=int(match.group(1)))).isoformat()
+    if not re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", raw) or not _valid_date(raw):
+        sys.stderr.write(
+            "error: --review must be a date like 2026-11-15 or a number of days like 14d (got %r)\n" % text
+        )
+        sys.exit(1)
+    if raw < date.today().isoformat():
+        sys.stderr.write("error: --review date %s is in the past\n" % raw)
+        sys.exit(1)
+    return raw
+
+
+def waiting_options_or_fail(args, bucket):
+    """Validate --review and --resolves-when for a target bucket.
+    Returns (review date or None, resolves-when text or None)."""
+    review = getattr(args, "review", None)
+    resolves_when = getattr(args, "resolves_when", None)
+    if (review is not None or resolves_when is not None) and bucket not in WAITING_BUCKETS:
+        sys.stderr.write(
+            "error: --review and --resolves-when only apply to Waiting on human "
+            "and Waiting on others, not %s\n" % bucket
+        )
+        sys.exit(1)
+    if resolves_when is not None:
+        reject_newlines(resolves_when, "resolves-when text")
+        if not resolves_when.strip():
+            sys.stderr.write("error: --resolves-when text must not be empty\n")
+            sys.exit(1)
+    if review is not None:
+        review = parse_review_arg(review)
+    return review, resolves_when
+
+
 def cmd_add(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
@@ -2896,9 +3064,17 @@ def cmd_add(args):
     reject_newlines(args.text, "item text")
     if args.because:
         reject_newlines(args.because, "because text")
+    review, resolves_when = waiting_options_or_fail(args, bucket)
     text = args.text
     if args.because:
         text = "%s, because %s" % (text, args.because)
+    if resolves_when:
+        text = "%s, resolves when %s" % (text, resolves_when)
+    if review:
+        if review_marker(text)[1] is not None:
+            sys.stderr.write("error: item text already ends with a [review ...] date; drop it or drop --review\n")
+            return 1
+        text = with_review(text, review)
     new_id = state.next_id(archive)
     take_snapshot(directory, "pre-write")
     state.set_last_id(new_id)
@@ -2920,14 +3096,17 @@ def find_item_or_fail(state, item_id):
     return item
 
 
-def _move_impl(directory, state, archive, item, bucket):
+def _move_impl(directory, state, archive, item, bucket, new_text=None):
     """Move an item object already located in `state` to `bucket`.
 
     The item's indented continuations move with it, as one block.
+    `new_text` replaces the item's text (used for review markers).
     """
     old_index = item.line_index
     ending = item.ending
     block = item_block_lines(state, item)
+    if new_text is not None:
+        item.text = new_text
     new_content = item.render()
     # Update the date on the move.
     new_item = Item(old_index, new_content, ending, bucket)
@@ -2960,14 +3139,32 @@ def cmd_move_real(args):
     if item.bucket == "Parked" and not args.owner_approved:
         sys.stderr.write("error: #%d is Parked; moving out of Parked requires --owner-approved.\n" % item_id)
         return 1
+    review, resolves_when = waiting_options_or_fail(args, bucket)
     if item.bucket == bucket:
         print("#%d is already in %s; nothing changed" % (item_id, bucket))
         return 0
+    if resolves_when is not None and item.has_resolves_when:
+        sys.stderr.write("error: #%d already says what resolves it; use update to reword it\n" % item_id)
+        return 1
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    _move_impl(directory, state, archive, item, bucket)
-    print("moved #%d to %s" % (item_id, bucket))
+    new_text = None
+    dropped = None
+    if bucket not in WAITING_BUCKETS and item.review_date is not None:
+        # A review date only means something on a waiting item.
+        dropped = item.review_date
+        new_text = with_review(item.text, None)
+    elif resolves_when is not None or review is not None:
+        base, old_review = review_marker(item.text)
+        if resolves_when is not None:
+            base = "%s, resolves when %s" % (base, resolves_when)
+        new_text = with_review(base, review or old_review)
+    _move_impl(directory, state, archive, item, bucket, new_text)
+    if dropped:
+        print("moved #%d to %s; dropped review date %s" % (item_id, bucket, dropped))
+    else:
+        print("moved #%d to %s" % (item_id, bucket))
     return 0
 
 
@@ -2990,12 +3187,67 @@ def cmd_update(args):
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
     item = find_item_or_fail(state, item_id)
-    item.text = args.text
+    kept_review = None
+    if (
+        item.bucket in WAITING_BUCKETS
+        and item.review_date is not None
+        and review_marker(args.text)[1] is None
+    ):
+        # Rewording a waiting item keeps its review date.
+        kept_review = item.review_date
+        item.text = with_review(args.text, kept_review)
+    else:
+        item.text = args.text
     item.item_date = today_str()
     item.starred = False
     state.lines[item.line_index][0] = item.render()
     atomic_write(os.path.join(directory, STATE), state.lines)
-    print("updated #%d" % item_id)
+    if kept_review:
+        print("updated #%d (kept review date %s)" % (item_id, kept_review))
+    else:
+        print("updated #%d" % item_id)
+    return 0
+
+
+def cmd_recheck(args):
+    """Record 'still waiting' on a waiting item: set its next review
+    date and add a dated note under it. The item's own date (when the
+    wait started) is never changed."""
+    directory = require_root()
+    state, archive = read_state_and_archive(directory)
+    validate_or_fail(state, archive)
+    item_id = parse_id(args.item)
+    if item_id is None:
+        sys.stderr.write("error: bad item id %r\n" % args.item)
+        return 1
+    item = find_item_or_fail(state, item_id)
+    if item.bucket not in WAITING_BUCKETS:
+        sys.stderr.write(
+            "error: recheck only applies to waiting items; #%d is in %s\n"
+            % (item_id, item.bucket)
+        )
+        return 1
+    if args.because is None or not args.because.strip():
+        sys.stderr.write("error: recheck needs --because: say why it is still waiting\n")
+        return 1
+    reject_newlines(args.because, "because text")
+    review = parse_review_arg(args.review)
+    take_snapshot(directory, "pre-write")
+    state, archive = read_state_and_archive(directory)
+    item = find_item_or_fail(state, item_id)
+    item.text = with_review(item.text, review)
+    state.lines[item.line_index][0] = item.render()
+    note = "  - %s still waiting: %s" % (today_str(), args.because.strip())
+    insert_at = item.line_index + 1 + len(item.continuation_indices)
+    ending = item.ending or state.dominant_ending()
+    terminate_line_before(state, insert_at, ending)
+    state.lines.insert(insert_at, [note, ending])
+    atomic_write(os.path.join(directory, STATE), state.lines)
+    rechecks = recheck_count(state, item) + 1
+    print(
+        "rechecked #%d, next review %s (deferred %d time%s)"
+        % (item_id, review, rechecks, "" if rechecks == 1 else "s")
+    )
     return 0
 
 
@@ -3145,6 +3397,128 @@ def cmd_archive(args):
     return 0
 
 
+CHECK_RECEIPT = os.path.join(".statecat", "last-check.json")
+
+
+def _file_sha256(path):
+    """sha256 hex of a file's bytes, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def read_check_receipt(directory):
+    """The last check's receipt (a dict), or None when there is none
+    or it is unreadable. A broken receipt is treated as no receipt."""
+    try:
+        with open(os.path.join(directory, CHECK_RECEIPT), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("time"), str):
+        return None
+    return data
+
+
+def receipt_changed_files(directory, receipt):
+    """Which state files differ from what the receipt's check saw."""
+    changed = []
+    for filename, key in ((STATE, "state_sha256"), (ARCHIVE, "archive_sha256")):
+        if _file_sha256(os.path.join(directory, filename)) != receipt.get(key):
+            changed.append(filename)
+    return changed
+
+
+def _receipt_time(receipt):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(receipt["time"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _format_age(seconds):
+    if seconds < 60:
+        return "just now"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds // size)
+            return "%d %s%s ago" % (count, unit, "" if count == 1 else "s")
+    return "just now"
+
+
+def describe_check_receipt(directory, receipt):
+    """One 'Last check: ...' line for status."""
+    from datetime import datetime
+    if receipt is None:
+        return "Last check: never recorded"
+    when = _receipt_time(receipt)
+    if when is None:
+        return "Last check: never recorded"
+    result = receipt.get("result")
+    if result == "warnings":
+        count = receipt.get("warnings", 0)
+        result = "%s warning%s" % (count, "" if count == 1 else "s")
+    elif result == "problems":
+        count = receipt.get("problems", 0)
+        result = "%s structural problem%s" % (count, "" if count == 1 else "s")
+    else:
+        result = "clean"
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+    age = _format_age(max(0.0, (now - when).total_seconds()))
+    changed = receipt_changed_files(directory, receipt)
+    if changed:
+        since = "%s changed since" % " and ".join(changed)
+    else:
+        since = "files unchanged since"
+    return "Last check: %s, %s, %s, %s" % (when.strftime("%Y-%m-%d %H:%M"), result, age, since)
+
+
+def check_receipt_json(directory):
+    """The receipt for show --json, with files_changed_since added."""
+    receipt = read_check_receipt(directory)
+    if receipt is None:
+        return None
+    data = dict(receipt)
+    data["files_changed_since"] = bool(receipt_changed_files(directory, receipt))
+    return data
+
+
+def write_check_receipt(directory, problems, warnings, last_id):
+    """Record this check in .statecat/last-check.json, overwriting the
+    previous one. It records that the files passed (or failed) the
+    structural check at this time, not that their entries are true.
+    A receipt that cannot be written is a note, never a failure."""
+    from datetime import datetime
+    if problems:
+        result = "problems"
+    elif warnings:
+        result = "warnings"
+    else:
+        result = "clean"
+    data = {
+        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "result": result,
+        "problems": len(problems),
+        "warnings": len(warnings),
+        "state_sha256": _file_sha256(os.path.join(directory, STATE)),
+        "archive_sha256": _file_sha256(os.path.join(directory, ARCHIVE)),
+        "last_id": last_id,
+        "version": VERSION,
+    }
+    path = os.path.join(directory, CHECK_RECEIPT)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        atomic_write_bytes(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+    except OSError as exc:
+        sys.stderr.write(
+            "note: could not record this check in %s (%s)\n"
+            % (CHECK_RECEIPT, exc.strerror or exc)
+        )
+
+
 def cmd_check(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
@@ -3205,7 +3579,16 @@ def cmd_check(args):
                 print("fixed Last ID used to #%d" % highest)
         else:
             print("check: nothing to fix")
+        # The receipt describes the files as they are now, after the fix.
+        state, archive = read_state_and_archive(directory)
+        write_check_receipt(
+            directory,
+            structural_problems(state, archive),
+            warnings_for(state, archive, directory),
+            state.last_id,
+        )
         return 0
+    write_check_receipt(directory, problems, warnings, state.last_id)
     if problems:
         print("check: %d structural problem(s)" % len(problems))
         return 1
@@ -3403,7 +3786,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.4.0: one living project state, readable by any agent "
+            "StateCat v1.5.0: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )
@@ -3446,12 +3829,16 @@ def build_parser():
     p.add_argument("bucket", help="Bucket name")
     p.add_argument("text", help="Item text")
     p.add_argument("--because", help="Rationale, appended as ', because ...'")
+    p.add_argument("--resolves-when", dest="resolves_when", help="Waiting items: what resolves it, appended as ', resolves when ...'")
+    p.add_argument("--review", help="Waiting items: when to look again, YYYY-MM-DD or Nd (days from today)")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("move", help="Move an item to another bucket by ID")
     p.add_argument("item", help="Item ID, e.g. 12")
     p.add_argument("bucket", help="Target bucket name")
     p.add_argument("--owner-approved", action="store_true", help="Required to move out of Parked")
+    p.add_argument("--resolves-when", dest="resolves_when", help="Into a waiting bucket: what resolves it")
+    p.add_argument("--review", help="Into a waiting bucket: when to look again, YYYY-MM-DD or Nd")
     p.set_defaults(func=cmd_move_real)
 
     p = sub.add_parser("update", help="Replace an item's wording by ID")
@@ -3459,6 +3846,12 @@ def build_parser():
     p.add_argument("text", help="New wording")
     p.add_argument("--owner-approved", action="store_true", help="Required for a parked item")
     p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("recheck", help="Record 'still waiting' on a waiting item and set its next review date")
+    p.add_argument("item", help="Waiting item ID, e.g. 4")
+    p.add_argument("--review", required=True, help="Next review date, YYYY-MM-DD or Nd (days from today)")
+    p.add_argument("--because", help="Why it is still waiting (required)")
+    p.set_defaults(func=cmd_recheck)
 
     p = sub.add_parser("supersede", help="Replace a Decided item with a new ID, archiving the old one")
     p.add_argument("item", help="Decided item ID, e.g. 3")
@@ -3541,7 +3934,7 @@ def main(argv=None):
     # fails cleanly inside the lock, once the first has created
     # the files, instead of overwriting them.
     if args.command in (
-        "add", "move", "update", "supersede", "archive", "compact",
+        "add", "move", "update", "recheck", "supersede", "archive", "compact",
         "show", "status", "search", "check", "diff",
     ):
         directory = require_root()

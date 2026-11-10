@@ -1,8 +1,16 @@
 # Plan: last-check record and review dates for waiting items
 
-Status: proposal, not started. StateCat feature work is closed, so nothing
-here gets built until Adrian says go.
-Target: v1.5.0. Ship part 1 first; it is small and separate from part 2.
+Status: shipped in v1.5.0 (see CHANGELOG). Decisions taken, and where the
+build differs from the plan below:
+- Receipt stays in `.statecat/`, not in STATE.md.
+- `[review YYYY-MM-DD]` kept as the marker syntax.
+- `recheck` requires `--because`.
+- `waiting_needs_review` was not built (YAGNI; config has no booleans).
+- `check` does not print a "changed since" note: it would fire after
+  every normal `add` and add noise to every session-start hook. The
+  information is in `status` and `show --json`.
+- `status` keeps its `Stale waiting items` line and adds
+  `Waiting items due for review` and `Longest wait` beside it.
 Source: Moltbook feedback, sections 6b, 7a-7c (part 1) and 1, 2, 8c, 9c, 9g
 (part 2).
 
