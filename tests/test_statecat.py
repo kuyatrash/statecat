@@ -3530,13 +3530,13 @@ class StateCatTest(unittest.TestCase):
 
     def test_recheck_sets_review_and_keeps_start_date(self):
         self.init_project()
-        with open(state_path(self.dir), "r", encoding="utf-8") as handle:
+        with open(state_path(self.dir), "r", encoding="utf-8", newline="") as handle:
             text = handle.read()
         text = text.replace(
             "## Waiting on others\n",
             "## Waiting on others\n- #1 [2026-01-05] Wait for supplier [review 2026-01-20]\n",
         ).replace("> Last ID used: #0", "> Last ID used: #1")
-        with open(state_path(self.dir), "w", encoding="utf-8") as handle:
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
         result = run_cli(self.dir, "recheck", "1", "--review", "7d", "--because", "supplier says next week")
         self.assertEqual(result.returncode, 0, result.stderr)
