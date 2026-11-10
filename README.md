@@ -136,6 +136,8 @@ python3 statecat.py search "launch date"
 python3 statecat.py add Open "Bake the test batch"
 python3 statecat.py add Decided "Sell at the Saturday market" --because "foot traffic is highest there"
 python3 statecat.py move 2 "Waiting on human"
+python3 statecat.py add others "Flour delivery" --resolves-when "the supplier confirms a date" --review 14d
+python3 statecat.py recheck 5 --review 7d --because "supplier says next week"
 python3 statecat.py update 2 "Bake the test batch on Friday"
 python3 statecat.py archive 2
 python3 statecat.py compact --older-than 90
@@ -146,13 +148,18 @@ python3 statecat.py diff
 ```
 
 `show --json` prints the same state as machine-readable JSON
-(project, last ID, and one item list per bucket) for agents that
+(project, last ID, the last check receipt, and one item list per
+bucket) for agents that
 would rather parse JSON than Markdown. Each item has `id`, `date`,
 `starred`, `text` (its first line), and `continuation` (its
 hand-wrapped indented lines, stripped; empty for most items).
+Waiting items also have `review` (their review date or null),
+`resolves_when` (true when the text says what resolves it) and
+`rechecks` (how many times `recheck` has put them off).
 `status` prints a compact
-summary: bucket counts, stale waiting items, Last ID used, file
-size, and the check result. `search` finds items by
+summary: bucket counts, waiting items due for review, stale
+waiting items, the longest current wait, Last ID used, when
+`check` last ran, file size, and the check result. `search` finds items by
 case-insensitive text, including wrapped continuation lines, with
 `--archive` to include archived items;
 when nothing matches it prints "no matches" and exits with code 1.
@@ -325,6 +332,50 @@ does not chase them. It also warns when `STATE.md` grows past 150
 lines or 10 KB, because the archive must not creep back into the
 main file. The 14-day threshold and the size budget are tunable
 in `.statecat/config` (see Configuration).
+
+### Review dates
+
+A waiting item can say what resolves it and when to look again:
+
+```
+- #5 [2026-10-26] Flour delivery, resolves when the supplier confirms a date [review 2026-11-09]
+  - 2026-11-09 still waiting: supplier says next week
+```
+
+`add` and `move` into a waiting bucket take `--resolves-when TEXT`
+and `--review DATE` (a date like 2026-11-15, or `14d` for 14 days
+from today; past dates are rejected). `[review YYYY-MM-DD]` must be
+the last thing on the item's first line; anywhere else it is just
+text. The leading date stays the day the wait started.
+
+On or after its review date, `check` reports the item as `due:`
+(a warning, never a structural problem, and never a prompt to
+chase it). Then do one of three things: `move` it out (resolved),
+raise it with the owner, or put it off with
+`recheck ID --review DATE --because TEXT`. `recheck` sets the next
+review date and adds a dated "still waiting" note under the item,
+without touching its start date; `--because` is required, so every
+deferral says why. A due item that has been put off before says
+how many times. A waiting item with a review date in the future is
+not flagged as stale however old it is; one without a review date
+keeps the 14-day rule. `update` keeps a waiting item's review date
+unless the new wording has its own, and `move` out of a waiting
+bucket drops the review date (the resolves-when text and recheck
+notes stay as history). StateCat only reports a due item; it never
+acts on one.
+
+### When check last ran
+
+Every `check` (and `check --fix`, after its fix) overwrites
+`.statecat/last-check.json` with the time, the result, and a
+sha256 of `STATE.md` and `STATE-ARCHIVE.md`. `status` turns that
+into one line, for example
+`Last check: 2026-11-10 09:14, clean, 3 hours ago, files unchanged since`,
+or `STATE.md changed since` when the files no longer match what
+was checked. It records that the files passed the structural
+check at that time, not that their entries are still true. If the
+receipt cannot be written, `check` prints a note and keeps its
+normal result. `status` and `show` never write it.
 
 ## Configuration
 
