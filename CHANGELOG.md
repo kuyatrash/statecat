@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.5.1 — 2026-11-11
+
+Bug-fix release from a read-through and a fuzz of hand-edited state
+files. Upgrading needs no action. `restore --list` now prints
+snapshots in true time order, so a script that relied on safety
+snapshots being listed last will see them in between.
+
+- A hand-added line with no ID no longer crashes anything. A waiting
+  line with a date but no ID crashed `check`, `status` and the
+  SessionStart hook with a traceback once it was older than
+  `stale_days`, and so did a line with a starred date and no ID.
+  That also blocked `check --fix`, the command that repairs such a
+  line. Both now report the item as `#?`, like the other warnings.
+- `compact` no longer crashes on an old Decided line with no ID. The
+  dry run failed on its first line; the real run had already moved
+  the line into the archive, where nothing can find it by ID, and
+  then failed before printing what it archived. Such a line now
+  stays in STATE.md and compact says how many it skipped and to run
+  `check --fix`.
+- `init` no longer crashes on a `.gitignore` that is not valid UTF-8.
+  It used to fail with UnicodeDecodeError after STATE.md and
+  STATE-ARCHIVE.md were already created. The file is now read and
+  appended to as bytes, so its existing bytes are never rewritten,
+  and the added line uses the file's own line endings (CRLF stays
+  CRLF). `/.statecat/` and `/.statecat` count as already ignored.
+- A refused `init` leaves nothing behind. Running `init` in a
+  subfolder of an existing project was refused, but only after the
+  lock had created an empty `.statecat/` there.
+- A project folder that cannot be written (no permission, read-only
+  filesystem) now gives a clean error from every command instead of
+  a PermissionError traceback, and says that even read-only commands
+  need write access to `.statecat/` for the lock.
+- A lock owner file that is not valid UTF-8 is read as "no token"
+  instead of raising.
+- Snapshots are ordered by the timestamp in their name, not by
+  folder mtime. Pruning used folder mtimes, which copying or
+  unpacking a project resets, so it could delete a recent snapshot
+  and keep an old one. `restore --list` used a plain name sort,
+  which put every safety snapshot after every pre-write one.
+- `restore NAME` and `diff NAME` accept an exact snapshot name even
+  when it is also the prefix of another.
+- Faster start. Measured on Windows with Python 3.12, from roughly
+  85-95 ms per command: about 13 ms less for `show`, `search`,
+  `pointer` and `restore --list`, 10 ms for writes and `diff`, 8 ms
+  for `status` and 5 ms for `check`. `difflib`, `hashlib`, `shlex`
+  and `tempfile` are imported only by the functions that use them,
+  and lock tokens come from `os.urandom` instead of `uuid`. What is
+  left is almost all Python starting up, importing `argparse` and
+  `re`, and compiling the script; StateCat's own work is about
+  10 ms of it.
+- `search` builds each item's text once instead of twice.
+
 ## 1.5.0 — 2026-11-10
 
 Two additions from the Moltbook feedback review: a record of when
