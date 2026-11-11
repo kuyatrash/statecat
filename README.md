@@ -164,7 +164,9 @@ case-insensitive text, including wrapped continuation lines, with
 `--archive` to include archived items;
 when nothing matches it prints "no matches" and exits with code 1.
 `compact` archives Decided items older than N days (default 90),
-with `--dry-run` to preview; it never touches live buckets.
+with `--dry-run` to preview; it never touches live buckets. A
+hand-added Decided line that has no ID yet is left where it is and
+reported; run `check --fix` to give it one.
 `diff` shows the unified diff between a snapshot and the current
 files, so you can see what changed before restoring.
 
@@ -293,8 +295,9 @@ python3 statecat.py restore --list
 python3 statecat.py restore
 ```
 
-`restore` with no argument restores the most recent pre-write
-snapshot. A snapshot taken to protect a restore is a safety
+`restore --list` lists snapshots oldest first, by the timestamp
+in each name. `restore` with no argument restores the most recent
+pre-write snapshot. A snapshot taken to protect a restore is a safety
 snapshot, listed as such, and is never the default target, so
 running restore twice restores the same snapshot and does not
 flip back. You can still restore a safety snapshot by naming it

@@ -1686,7 +1686,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.5.0"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.5.1"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
@@ -3356,7 +3356,7 @@ class StateCatTest(unittest.TestCase):
         receipt = self.receipt()
         self.assertEqual(receipt["result"], "clean")
         self.assertEqual(receipt["problems"], 0)
-        self.assertEqual(receipt["version"], "1.5.0")
+        self.assertEqual(receipt["version"], "1.5.1")
         self.assertEqual(
             receipt["state_sha256"],
             hashlib.sha256(read_bytes(state_path(self.dir))).hexdigest(),
@@ -3618,6 +3618,249 @@ class StateCatTest(unittest.TestCase):
             handle.write(text)
         run_cli(self.dir, "add", "open", "other item")
         self.assertIn(line, read_text(state_path(self.dir)))
+
+
+    # 1.5.1: a hand-added line with no ID is a warning, never a crash.
+    def put_under(self, heading, *lines):
+        """Hand-edit STATE.md: add raw lines right under a bucket heading."""
+        text = read_text(state_path(self.dir))
+        marker = "## %s\n" % heading
+        self.assertIn(marker, text)
+        text = text.replace(marker, marker + "".join(line + "\n" for line in lines), 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+
+    def test_stale_waiting_item_without_id_warns_instead_of_crashing(self):
+        # A waiting line typed by hand, with a date but no ID, used to
+        # crash check, status and the SessionStart hook once it was
+        # older than stale_days, which also blocked `check --fix`,
+        # the one command that repairs it.
+        for bucket in ("Waiting on human", "Waiting on others"):
+            with self.subTest(bucket=bucket):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.dir = self.tmp.name
+                self.init_project()
+                self.put_under(bucket, "- [2026-01-01] typed by hand, no id")
+                result = run_cli(self.dir, "check")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("has no ID", result.stdout)
+                self.assertIn("stale: #? in %s is " % bucket, result.stdout)
+                result = run_cli(self.dir, "status")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Stale waiting items: 1", result.stdout)
+                result = run_cli(self.dir, "check", "--fix")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("fixed #1", result.stdout)
+                result = run_cli(self.dir, "check")
+                self.assertIn("stale: #1 in %s is " % bucket, result.stdout)
+
+    def test_starred_date_without_id_warns_instead_of_crashing(self):
+        self.init_project()
+        self.put_under("Open", "- [2026-11-01*] starred by hand, no id")
+        result = run_cli(self.dir, "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("warning: #? in STATE.md has an assigned date [2026-11-01*]", result.stdout)
+
+    def test_compact_leaves_decided_items_without_id(self):
+        # An old Decided line with no ID used to crash compact: the
+        # dry run on its first line, the real run after it had already
+        # moved the line into the archive.
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "Old decision with an id")
+        self.backdate_item(1, "2020-01-02")
+        self.put_under("Decided", "- [2020-01-01] old decision, no id")
+        result = run_cli(self.dir, "compact", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would archive #1", result.stdout)
+        self.assertIn("skipped 1 Decided item(s) with no ID", result.stdout)
+        result = run_cli(self.dir, "compact")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("archived #1", result.stdout)
+        self.assertIn("skipped 1 Decided item(s) with no ID", result.stdout)
+        self.assertIn("- [2020-01-01] old decision, no id", read_text(state_path(self.dir)))
+        archive = read_text(archive_path(self.dir))
+        self.assertIn("Old decision with an id", archive)
+        self.assertNotIn("no id", archive)
+        # Only the ID-less line is left: nothing to do, and it says why.
+        result = run_cli(self.dir, "compact")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing to compact", result.stdout)
+        self.assertIn("skipped 1 Decided item(s) with no ID", result.stdout)
+        self.assertEqual(run_cli(self.dir, "check").returncode, 0)
+
+    # 1.5.1: init and .gitignore.
+    def test_init_with_non_utf8_gitignore_keeps_its_bytes(self):
+        # A .gitignore in another encoding used to crash init with
+        # UnicodeDecodeError, after STATE.md was already created.
+        original = b"# caf\xe9 build output\r\nnode_modules/\r\n"
+        with open(os.path.join(self.dir, ".gitignore"), "wb") as handle:
+            handle.write(original)
+        result = run_cli(self.dir, "init", "Latin Project", "--no-pointer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("added .statecat/ to .gitignore", result.stdout)
+        # The existing bytes are untouched and the new line matches
+        # the file's own CRLF line endings.
+        self.assertEqual(read_bytes(os.path.join(self.dir, ".gitignore")), original + b".statecat/\r\n")
+
+    def test_gitignore_anchored_entry_counts_as_already_ignored(self):
+        for entry in ("/.statecat/", "/.statecat", ".statecat"):
+            with self.subTest(entry=entry):
+                with tempfile.TemporaryDirectory() as folder:
+                    original = ("dist/\n%s\n" % entry).encode("utf-8")
+                    with open(os.path.join(folder, ".gitignore"), "wb") as handle:
+                        handle.write(original)
+                    result = run_cli(folder, "init", "Anchored", "--no-pointer")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(".statecat/ already in .gitignore", result.stdout)
+                    self.assertEqual(read_bytes(os.path.join(folder, ".gitignore")), original)
+
+    def test_refused_init_leaves_nothing_behind(self):
+        # init takes the lock, and the lock creates .statecat/. A
+        # refused init in a subfolder used to leave that folder there.
+        self.init_project()
+        sub = os.path.join(self.dir, "sub")
+        os.mkdir(sub)
+        result = run_cli(sub, "init", "Inner")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already exists in parent project root", result.stderr)
+        self.assertEqual(os.listdir(sub), [])
+        # Refusing to overwrite an existing project still works.
+        result = run_cli(self.dir, "init", "Again")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refusing to overwrite", result.stderr)
+
+    # 1.5.1: snapshots are ordered by the timestamp in their name.
+    def snapshot_names(self):
+        result = run_cli(self.dir, "restore", "--list")
+        return [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+
+    def test_restore_list_is_oldest_first_across_kinds(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "One")
+        run_cli(self.dir, "add", "Open", "Two")
+        run_cli(self.dir, "restore")           # takes a safety snapshot
+        run_cli(self.dir, "add", "Open", "Three")
+        names = self.snapshot_names()
+        self.assertEqual(len(names), 4)
+        stamps = [name.replace("safety-", "") for name in names]
+        self.assertEqual(stamps, sorted(stamps))
+        # The safety snapshot sits between the writes around it.
+        self.assertTrue(names[2].startswith("safety-"), names)
+
+    def test_pruning_follows_snapshot_names_not_folder_mtimes(self):
+        # Copying or unpacking a project resets folder mtimes. The
+        # oldest snapshot by name must still be the one pruned.
+        self.init_project()
+        for index in range(4):
+            run_cli(self.dir, "add", "Open", "Item %d" % index)
+        names = self.snapshot_names()
+        self.assertEqual(len(names), 4)
+        root = os.path.join(self.dir, ".statecat", "backups")
+        now = time.time()
+        os.utime(os.path.join(root, names[0]), (now + 5000, now + 5000))   # oldest looks newest
+        os.utime(os.path.join(root, names[2]), (now - 90000, now - 90000))  # a recent one looks oldest
+        result = run_cli(self.dir, "config", "set", "backups_kept", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_cli(self.dir, "add", "Open", "One more")
+        kept = self.snapshot_names()
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(kept[:2], names[2:])
+        self.assertNotIn(names[0], kept)
+        self.assertNotIn(names[1], kept)
+
+    def test_find_snapshot_prefers_an_exact_name(self):
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        snapshots = [("2026", "pre-write", "a"), ("20261101", "pre-write", "b")]
+        self.assertEqual(statecat.find_snapshot(snapshots, "2026"), snapshots[0])
+        self.assertEqual(statecat.find_snapshot(snapshots, "202611"), snapshots[1])
+        with self.assertRaises(ValueError):
+            statecat.find_snapshot(snapshots + [("20261102", "pre-write", "c")], "202611")
+
+    # 1.5.1: lock failures are clean errors, never tracebacks.
+    def test_unwritable_lock_folder_fails_cleanly(self):
+        # A read-only project folder made every command, read-only
+        # ones included, end in a raw PermissionError traceback.
+        sys.path.insert(0, ROOT)
+        import io
+        import statecat
+        from unittest import mock
+
+        self.init_project()
+        real_mkdir = os.mkdir
+
+        def denied_mkdir(path, *args, **kwargs):
+            if os.path.basename(str(path)) == "lock":
+                raise PermissionError(13, "Permission denied")
+            return real_mkdir(path, *args, **kwargs)
+
+        lock = statecat.project_lock(self.dir)
+        errors = io.StringIO()
+        with mock.patch.object(statecat.os, "mkdir", side_effect=denied_mkdir):
+            with mock.patch("sys.stderr", errors):
+                with self.assertRaises(SystemExit) as caught:
+                    lock.__enter__()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertFalse(lock.acquired)
+        self.assertIn("cannot create the project lock", errors.getvalue())
+        self.assertIn("Permission denied", errors.getvalue())
+        self.assertIn("No files were changed.", errors.getvalue())
+
+    def test_unwritable_statecat_folder_fails_cleanly(self):
+        sys.path.insert(0, ROOT)
+        import io
+        import statecat
+        from unittest import mock
+
+        errors = io.StringIO()
+        with mock.patch.object(statecat.os, "makedirs", side_effect=PermissionError(13, "Permission denied")):
+            with mock.patch("sys.stderr", errors):
+                with self.assertRaises(SystemExit) as caught:
+                    statecat.ensure_dir(os.path.join(self.dir, ".statecat"))
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("cannot create the folder", errors.getvalue())
+
+    def test_lock_owner_file_with_invalid_bytes_reads_as_no_token(self):
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        lock_path = os.path.join(self.dir, ".statecat", "lock")
+        os.makedirs(lock_path)
+        with open(os.path.join(lock_path, "owner"), "wb") as handle:
+            handle.write(b"pid=1\ntoken=\xff\xfe\n")
+        lock = statecat.project_lock(self.dir)
+        self.assertIsNone(lock._read_owner_token())
+
+    def test_lock_tokens_are_unique_and_keep_their_shape(self):
+        sys.path.insert(0, ROOT)
+        import statecat
+
+        self.init_project()
+        tokens = set()
+        for _ in range(3):
+            with statecat.project_lock(self.dir) as lock:
+                self.assertRegex(lock.owner_token, r"^%d-[0-9a-f]{32}$" % os.getpid())
+                tokens.add(lock.owner_token)
+        self.assertEqual(len(tokens), 3)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ".statecat", "lock")))
+
+    def test_startup_does_not_import_rarely_used_modules(self):
+        # Every run pays for its top-level imports; difflib, hashlib,
+        # shlex, tempfile and uuid are loaded only where they are used.
+        code = (
+            "import sys; sys.path.insert(0, %r); import statecat; "
+            "print(sorted(m for m in ('difflib', 'hashlib', 'shlex', 'tempfile', 'uuid') if m in sys.modules))"
+            % ROOT
+        )
+        result = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]")
 
 
 if __name__ == "__main__":

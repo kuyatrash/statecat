@@ -89,7 +89,8 @@ SessionStart hook to `.claude/settings.json` that runs `show` and
 - `search <text>` finds items by case-insensitive text, with
   `--archive` to include archived items. `compact` archives
   Decided items older than N days (default 90) with `--dry-run` to
-  preview; it never touches live buckets. `diff` shows the unified
+  preview; it never touches live buckets, and it leaves a Decided
+  line with no ID in place (run `check --fix` first). `diff` shows the unified
   diff between a snapshot and the current files. `.statecat/config`
   (JSON) tunes stale days, size budget, backup count, and lock
   timing; `config` prints the effective settings, `config set`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.5.0: one living project state, readable by any agent in one read.
+"""StateCat v1.5.1: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -78,22 +78,22 @@ Rules implemented here (StateCat scope, revision 5):
 """
 
 import argparse
-import difflib
-import hashlib
 import json
 import math
 import os
 import re
-import shlex
 import shutil
 import sys
-import tempfile
 import threading
 import time
-import uuid
 from datetime import date, timedelta
 
-VERSION = "1.5.0"
+# difflib, hashlib, shlex and tempfile are imported inside the few
+# functions that use them: every run pays for a top-level import, and
+# most commands (show, search, pointer) need none of the four. shutil
+# stays here: argparse imports it anyway while the parser is built.
+
+VERSION = "1.5.1"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -225,6 +225,13 @@ def with_review(text, review):
     if review is None:
         return base
     return "%s [review %s]" % (base, review)
+
+
+def id_label(item):
+    """'#12' for an item with an ID, '#?' for a hand-added line that
+    has none yet. A missing ID is a warning, never a crash, so every
+    message that may name such an item goes through here."""
+    return "#%s" % (item.item_id if item.item_id is not None else "?")
 
 
 def recheck_count(state, item):
@@ -707,9 +714,9 @@ def warnings_for(state, archive, directory=None):
             )
         elif item.starred:
             warnings.append(
-                "warning: #%d in %s has an assigned date [%s*] "
+                "warning: %s in %s has an assigned date [%s*] "
                 "whose age is unknown, not fresh"
-                % (item.item_id, STATE, item.item_date)
+                % (id_label(item), STATE, item.item_date)
             )
     for item in archive.items:
         if item.item_id is None:
@@ -804,15 +811,15 @@ def warnings_for(state, archive, directory=None):
             continue
         if item.bucket == "Waiting on human":
             warnings.append(
-                "stale: #%d in Waiting on human is %d days old "
+                "stale: %s in Waiting on human is %d days old "
                 "(owner only, not a prompt to chase)"
-                % (item.item_id, age)
+                % (id_label(item), age)
             )
         else:
             warnings.append(
-                "stale: #%d in Waiting on others is %d days old "
+                "stale: %s in Waiting on others is %d days old "
                 "(not a prompt to chase)"
-                % (item.item_id, age)
+                % (id_label(item), age)
             )
     return warnings
 
@@ -827,6 +834,11 @@ def ensure_dir(path):
         fail_cleanly(
             "'%s' must be a folder, but a file is in the way; "
             "move or delete that file and try again" % path
+        )
+    except OSError as exc:
+        # No write permission, a read-only filesystem, a full disk.
+        fail_cleanly(
+            "cannot create the folder '%s' (%s)" % (path, exc.strerror or exc)
         )
 
 
@@ -887,6 +899,7 @@ def atomic_write(path, lines):
     when the target exists, and takes the umask's mode for a
     new file, so a restrictive file is never silently opened
     up by a rewrite."""
+    import tempfile
     path = _write_target(path)
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
@@ -908,6 +921,7 @@ def atomic_write_bytes(path, data):
     """Write bytes atomically: temp, then rename. Same permission
     policy as atomic_write: keep the target's bits, umask for
     a new file."""
+    import tempfile
     path = _write_target(path)
     directory = os.path.dirname(path) or "."
     handle, tmp_path = tempfile.mkstemp(dir=directory, prefix=".statecat-tmp-")
@@ -1353,6 +1367,7 @@ class project_lock:
         if sys.platform == "win32":
             quoted = "'" + self.lock_path.replace("'", "''") + "'"
             return "Remove-Item -LiteralPath %s -Recurse -Force" % quoted
+        import shlex
         return "rm -rf %s" % shlex.quote(self.lock_path)
 
     def _lock_held_message(self, stale):
@@ -1470,7 +1485,8 @@ class project_lock:
                 for line in handle:
                     if line.startswith("token="):
                         return line.split("=", 1)[1].strip()
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError covers an owner file that is not valid UTF-8.
             pass
         return None
 
@@ -1482,7 +1498,7 @@ class project_lock:
 
     def _trash_path(self):
         """Unique sibling path for a lock dir moved out of the way."""
-        return "%s.gone-%d-%s" % (self.lock_path, os.getpid(), uuid.uuid4().hex)
+        return "%s.gone-%d-%s" % (self.lock_path, os.getpid(), os.urandom(16).hex())
 
     def _rename_lock_to_trash(self):
         """Atomically move the lock dir aside; return its new path or None.
@@ -1707,6 +1723,18 @@ class project_lock:
             except FileNotFoundError:
                 ensure_dir(os.path.dirname(self.lock_path))
                 continue
+            except OSError as exc:
+                # No write permission or a read-only filesystem. Every
+                # command that reads the state files takes the lock, so
+                # say what is needed instead of printing a traceback.
+                sys.stderr.write(
+                    "error: cannot create the project lock at %s (%s); "
+                    "statecat needs write access to .statecat/, even "
+                    "for read-only commands.\n"
+                    % (self.lock_path, exc.strerror or exc)
+                )
+                sys.stderr.write("No files were changed.\n")
+                sys.exit(1)
             # mkdir succeeded: write the owner file exclusively.
             # If we lost the race in the window between mkdir
             # and the write (another writer replaced our dir),
@@ -1747,7 +1775,7 @@ class project_lock:
         Returns True on success, False when the file already
         exists or the directory is gone (the caller retries).
         """
-        self.owner_token = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
+        self.owner_token = "%d-%s" % (os.getpid(), os.urandom(16).hex())
         try:
             with open(os.path.join(self.lock_path, "owner"), "x", encoding="utf-8") as handle:
                 handle.write("pid=%d time=%s\n" % (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
@@ -2066,9 +2094,11 @@ def list_snapshots(directory):
     """
     root = backup_root(directory)
     result = []
-    if not os.path.isdir(root):
+    try:
+        names = os.listdir(root)
+    except OSError:
         return result
-    for name in sorted(os.listdir(root)):
+    for name in names:
         path = os.path.join(root, name)
         if not os.path.isdir(path):
             continue
@@ -2076,7 +2106,16 @@ def list_snapshots(directory):
             result.append((name, "safety", path))
         else:
             result.append((name, "pre-write", path))
+    # Oldest first by the timestamp in the name, so a safety snapshot
+    # sorts between the pre-write snapshots taken before and after it.
+    result.sort(key=lambda item: (_snapshot_stamp(item[0]), item[0]))
     return result
+
+
+def _snapshot_stamp(name):
+    """The timestamp part of a snapshot name: 'safety-<stamp>' or
+    '<stamp>'. The stamp is fixed-width, so it sorts as text."""
+    return name[len("safety-"):] if name.startswith("safety-") else name
 
 
 def prune_snapshots(directory):
@@ -2087,9 +2126,6 @@ def prune_snapshots(directory):
     restore default always remains available.
     """
     keep = load_config(directory)["backups_kept"]
-    root = backup_root(directory)
-    if not os.path.isdir(root):
-        return
     snapshots = list_snapshots(directory)
     if len(snapshots) <= keep:
         return
@@ -2097,13 +2133,15 @@ def prune_snapshots(directory):
     latest_pre = pre_write[-1] if pre_write else None
     excess = len(snapshots) - keep
     deleted = 0
-    by_time = sorted(snapshots, key=lambda item: os.path.getmtime(item[2]))
-    for name, kind, path in by_time:
+    # list_snapshots is oldest first by the timestamp in each name.
+    # Folder mtimes are not used: copying or unpacking a project
+    # resets them, and the oldest snapshot must still go first.
+    for snapshot in snapshots:
         if deleted >= excess:
             break
-        if latest_pre is not None and (name, kind, path) == latest_pre:
+        if snapshot == latest_pre:
             continue
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(snapshot[2], ignore_errors=True)
         deleted += 1
 
 
@@ -2453,38 +2491,56 @@ def ensure_gitignore(directory):
         return None
     try:
         if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8", newline="") as handle:
+            # Bytes, not text: only our own ASCII line is added, so a
+            # .gitignore in another encoding must not stop init (it
+            # used to crash with UnicodeDecodeError after the state
+            # files were already created).
+            with open(path, "rb") as handle:
                 content = handle.read()
-            if any(line.strip() in (".statecat/", ".statecat") for line in content.splitlines()):
+            ignored = (b".statecat/", b".statecat", b"/.statecat/", b"/.statecat")
+            if any(line.strip() in ignored for line in content.splitlines()):
                 return ".statecat/ already in .gitignore"
-            with open(path, "a", encoding="utf-8", newline="") as handle:
-                if content and not content.endswith("\n"):
-                    handle.write("\n")
-                handle.write(".statecat/\n")
+            newline = b"\r\n" if b"\r\n" in content else b"\n"
+            with open(path, "ab") as handle:
+                if content and not content.endswith((b"\n", b"\r")):
+                    handle.write(newline)
+                handle.write(b".statecat/" + newline)
             return "added .statecat/ to .gitignore"
-        with open(path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(".statecat/\n")
+        with open(path, "wb") as handle:
+            handle.write(b".statecat/\n")
         return "created .gitignore with .statecat/"
     except OSError as exc:
         sys.stderr.write("warning: could not update .gitignore: %s\n" % exc)
         return None
 
 
-def cmd_init(args):
-    directory = os.getcwd()
+def init_refusal(directory):
+    """Why init must not run in `directory`, as an error line, or None
+    when it may. main() asks before taking the lock, because the lock
+    creates .statecat/ and a refused init must leave nothing behind;
+    cmd_init asks again under the lock, for two inits racing."""
     parent_root = find_project_root(os.path.dirname(os.path.abspath(directory)))
     if parent_root is not None:
-        sys.stderr.write(
+        return (
             "error: %s already exists in parent project root %s; "
             "refusing to create a second state file. "
             "Use that project root instead.\n" % (STATE, parent_root)
         )
+    if os.path.exists(os.path.join(directory, STATE)) or os.path.exists(
+        os.path.join(directory, ARCHIVE)
+    ):
+        return "error: %s or %s already exists; refusing to overwrite.\n" % (STATE, ARCHIVE)
+    return None
+
+
+def cmd_init(args):
+    directory = os.getcwd()
+    refusal = init_refusal(directory)
+    if refusal is not None:
+        sys.stderr.write(refusal)
         return 1
     state_path = os.path.join(directory, STATE)
     archive_path = os.path.join(directory, ARCHIVE)
-    if os.path.exists(state_path) or os.path.exists(archive_path):
-        sys.stderr.write("error: %s or %s already exists; refusing to overwrite.\n" % (STATE, ARCHIVE))
-        return 1
     # A blank name falls back like an omitted one, instead of writing
     # an empty "# Project:" header.
     project = (args.project or "").strip() or os.path.basename(os.path.abspath(directory)) or "My Project"
@@ -2911,12 +2967,14 @@ def cmd_search(args):
     needle = args.text.casefold()
     found = []
     for item in state.items:
-        if needle in item_full_text(state, item).casefold():
-            found.append((item.bucket, item, item_full_text(state, item)))
+        text = item_full_text(state, item)
+        if needle in text.casefold():
+            found.append((item.bucket, item, text))
     if getattr(args, "archive", False):
         for item in archive.items:
-            if needle in item_full_text(archive, item).casefold():
-                found.append(("Archived", item, item_full_text(archive, item)))
+            text = item_full_text(archive, item)
+            if needle in text.casefold():
+                found.append(("Archived", item, text))
     if not found:
         print("no matches for %r" % args.text)
         return 1
@@ -3316,13 +3374,17 @@ def cmd_supersede(args):
 
 
 def compact_candidates(state, days):
-    """Decided items older than `days`, and how many Decided items
-    were skipped because their age is unknown (no date, starred
-    date, or unparseable date). Only Decided items are ever compacted:
-    Open and waiting items are still live."""
+    """Decided items older than `days`, how many Decided items were
+    skipped because their age is unknown (no date, starred date, or
+    unparseable date), and how many old ones were skipped because
+    they have no ID. Only Decided items are ever compacted: Open and
+    waiting items are still live. An item with no ID stays where it
+    is: archived items are found by ID, and `check --fix` gives the
+    item one first."""
     today = date.today()
     candidates = []
     skipped = 0
+    no_id = 0
     for item in state.items:
         if item.bucket != "Decided":
             continue
@@ -3330,8 +3392,14 @@ def compact_candidates(state, days):
         if age is None:
             skipped += 1
         elif age > days:
-            candidates.append(item)
-    return candidates, skipped
+            if item.item_id is None:
+                no_id += 1
+            else:
+                candidates.append(item)
+    return candidates, skipped, no_id
+
+
+NO_ID_COMPACT_NOTE = "skipped %d Decided item(s) with no ID; run check --fix to give them one"
 
 
 def cmd_compact(args):
@@ -3344,19 +3412,23 @@ def cmd_compact(args):
     if problems:
         sys.stderr.write("error: structural problems must be fixed before compact can run.\n")
         return 1
-    candidates, skipped = compact_candidates(state, args.older_than)
+    candidates, skipped, no_id = compact_candidates(state, args.older_than)
     if not candidates:
         print("nothing to compact")
         if skipped:
             print("skipped %d Decided item(s) with unknown age" % skipped)
+        if no_id:
+            print(NO_ID_COMPACT_NOTE % no_id)
         return 0
     if args.dry_run:
         for item in candidates:
             print("would archive #%d %s" % (item.item_id, item.text))
+        if no_id:
+            print(NO_ID_COMPACT_NOTE % no_id)
         return 0
     take_snapshot(directory, "pre-write")
     state, archive = read_state_and_archive(directory)
-    candidates, _skipped = compact_candidates(state, args.older_than)
+    candidates, _skipped, no_id = compact_candidates(state, args.older_than)
     # Archive in file order, so the archive keeps the items' order,
     # then delete in reverse line order so earlier indices stay valid.
     in_order = sorted(candidates, key=lambda candidate: candidate.line_index)
@@ -3368,6 +3440,8 @@ def cmd_compact(args):
     atomic_write(os.path.join(directory, STATE), state.lines)
     for item in sorted(candidates, key=lambda candidate: candidate.item_id):
         print("archived #%d" % item.item_id)
+    if no_id:
+        print(NO_ID_COMPACT_NOTE % no_id)
     return 0
 
 
@@ -3402,6 +3476,7 @@ CHECK_RECEIPT = os.path.join(".statecat", "last-check.json")
 
 def _file_sha256(path):
     """sha256 hex of a file's bytes, or None when it cannot be read."""
+    import hashlib
     try:
         with open(path, "rb") as handle:
             return hashlib.sha256(handle.read()).hexdigest()
@@ -3606,7 +3681,9 @@ def find_snapshot(snapshots, name):
     Raises ValueError on an ambiguous prefix."""
     match = None
     for candidate in snapshots:
-        if candidate[0] == name or candidate[0].startswith(name):
+        if candidate[0] == name:
+            return candidate
+        if candidate[0].startswith(name):
             if match is not None:
                 raise ValueError("ambiguous snapshot %r" % name)
             match = candidate
@@ -3645,6 +3722,7 @@ def atomic_write_pair(directory, data_by_filename):
     so the window in which a crash could leave a mixed pair is
     just the two renames. Each file keeps its own target's
     permission bits (umask for a new file), like atomic_write."""
+    import tempfile
     staged = []
     try:
         for filename, data in data_by_filename:
@@ -3733,6 +3811,7 @@ def cmd_restore(args):
 
 
 def cmd_diff(args):
+    import difflib
     directory = require_root()
     snapshots = list_snapshots(directory)
     if args.snapshot:
@@ -3786,7 +3865,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.5.0: one living project state, readable by any agent "
+            "StateCat v1.5.1: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )
@@ -3941,6 +4020,10 @@ def main(argv=None):
         with project_lock(directory):
             return args.func(args)
     if args.command == "init":
+        refusal = init_refusal(os.getcwd())
+        if refusal is not None:
+            sys.stderr.write(refusal)
+            return 1
         with project_lock(os.getcwd()):
             return args.func(args)
     # pointer and hook --install/--uninstall read, edit and replace
