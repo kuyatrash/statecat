@@ -1686,7 +1686,7 @@ class StateCatTest(unittest.TestCase):
     def test_version_flag(self):
         result = run_cli(self.dir, "--version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.strip().startswith("statecat 1.5.1"))
+        self.assertTrue(result.stdout.strip().startswith("statecat 1.5.5"))
 
     def test_packaging_and_ci_files_exist(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "pyproject.toml")))
@@ -3356,7 +3356,7 @@ class StateCatTest(unittest.TestCase):
         receipt = self.receipt()
         self.assertEqual(receipt["result"], "clean")
         self.assertEqual(receipt["problems"], 0)
-        self.assertEqual(receipt["version"], "1.5.1")
+        self.assertEqual(receipt["version"], "1.5.5")
         self.assertEqual(
             receipt["state_sha256"],
             hashlib.sha256(read_bytes(state_path(self.dir))).hexdigest(),
@@ -3861,6 +3861,117 @@ class StateCatTest(unittest.TestCase):
         result = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[]")
+
+
+    # 1.5.5: the ID ledger in the check receipt.
+    def delete_item_line(self, item_id):
+        """Hand-edit STATE.md: delete one item's line, as a bad merge would."""
+        lines = read_lines(state_path(self.dir))
+        kept = [line for line in lines if not line.startswith("- #%d " % item_id)]
+        self.assertEqual(len(kept), len(lines) - 1)
+        with open(state_path(self.dir), "w", encoding="utf-8", newline="") as handle:
+            handle.writelines(kept)
+
+    def test_check_reports_an_id_that_vanished_from_both_files(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Keep")
+        run_cli(self.dir, "add", "Open", "Lose me")
+        self.assertNotIn("missing:", run_cli(self.dir, "check").stdout)
+        self.delete_item_line(2)
+        # Reported on every check, not just the first one after the loss.
+        for _ in range(2):
+            result = run_cli(self.dir, "check")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("missing: #2 was in the state files at an earlier check", result.stdout)
+            self.assertNotIn("missing: #1", result.stdout)
+        self.assertIn("Missing item IDs: 1", run_cli(self.dir, "status").stdout)
+        shown = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        self.assertEqual(shown["last_check"]["missing_ids"], [2])
+        self.assertNotIn("seen_ids", shown["last_check"])
+        result = run_cli(self.dir, "check", "--accept-missing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("accepted 1 missing item ID(s): #2", result.stdout)
+        self.assertNotIn("missing:", result.stdout)
+        self.assertIn("check: clean", run_cli(self.dir, "check").stdout)
+        self.assertIn("no missing item IDs to accept", run_cli(self.dir, "check", "--accept-missing").stdout)
+
+    def test_archived_superseded_and_moved_ids_are_not_missing(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Decided", "Old decision")
+        run_cli(self.dir, "add", "Open", "Task")
+        run_cli(self.dir, "add", "Open", "Another")
+        run_cli(self.dir, "check")
+        run_cli(self.dir, "supersede", "1", "New decision")
+        run_cli(self.dir, "archive", "2")
+        run_cli(self.dir, "move", "3", "parked")
+        result = run_cli(self.dir, "check")
+        self.assertNotIn("missing:", result.stdout)
+        self.assertIn("check: clean", result.stdout)
+
+    def test_lost_id_is_never_reissued_after_restore(self):
+        # restore puts Last ID used back, so the next add used to hand
+        # out an ID that had already named a different item.
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "First")
+        run_cli(self.dir, "add", "Open", "Second")
+        run_cli(self.dir, "check")
+        result = run_cli(self.dir, "restore")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("note: 1 item ID(s) seen at an earlier check", result.stdout)
+        self.assertNotIn("Second", read_text(state_path(self.dir)))
+        result = run_cli(self.dir, "add", "Open", "Third")
+        self.assertIn("added #3", result.stdout)
+        self.assertIn("missing: #2 ", run_cli(self.dir, "check").stdout)
+
+    def test_no_ledger_or_a_broken_one_reports_nothing_missing(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "Never checked")
+        self.delete_item_line(1)
+        self.assertNotIn("missing:", run_cli(self.dir, "check").stdout)
+        receipt_path = os.path.join(self.dir, ".statecat", "last-check.json")
+        receipt = json.loads(read_text(receipt_path))
+        self.assertEqual(receipt["seen_ids"], [])
+        for broken in ("everything", [1, "2", True, -4, 2.5, None], {"1": 1}):
+            receipt["seen_ids"] = broken
+            with open(receipt_path, "w", encoding="utf-8") as handle:
+                json.dump(receipt, handle)
+            result = run_cli(self.dir, "check")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            if broken == "everything" or isinstance(broken, dict):
+                self.assertNotIn("missing:", result.stdout)
+            else:
+                # Only the real integer survives: #1 is the lost item.
+                self.assertEqual(result.stdout.count("missing:"), 1)
+                self.assertIn("missing: #1 ", result.stdout)
+
+    # 1.5.5: add --since keeps "when it happened" apart from "when recorded".
+    def test_add_since_dates_the_item_and_says_when_it_was_recorded(self):
+        self.init_project()
+        result = run_cli(self.dir, "add", "others", "Wait for the vendor", "--since", "2026-11-01",
+                         "--resolves-when", "they reply", "--review", "3d")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            bucket_lines(read_text(state_path(self.dir)), "Waiting on others"),
+            ["- #1 [2026-11-01] Wait for the vendor, resolves when they reply (recorded %s) [review %s]"
+             % (TODAY, self.future(3))],
+        )
+        # The review marker is still the last thing on the line.
+        shown = json.loads(run_cli(self.dir, "show", "--json").stdout)
+        self.assertEqual(shown["buckets"]["Waiting on others"][0]["review"], self.future(3))
+        # Recording it the same day adds nothing.
+        run_cli(self.dir, "add", "Decided", "Same day", "--since", TODAY)
+        self.assertEqual(bucket_lines(read_text(state_path(self.dir)), "Decided"), ["- #2 [%s] Same day" % TODAY])
+
+    def test_add_since_rejects_bad_and_future_dates(self):
+        self.init_project()
+        before = read_bytes(state_path(self.dir))
+        for value, message in (("2999-01-01", "in the future"), ("2026-02-30", "must be a date"), ("yesterday", "must be a date"), ("3d", "must be a date")):
+            result = run_cli(self.dir, "add", "Open", "Nope", "--since", value)
+            self.assertEqual(result.returncode, 1, value)
+            self.assertIn(message, result.stderr)
+        self.assertEqual(read_bytes(state_path(self.dir)), before)
+        self.assertIn("no snapshots", run_cli(self.dir, "restore", "--list").stdout)
 
 
 if __name__ == "__main__":

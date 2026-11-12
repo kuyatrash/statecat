@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.5.5 — 2026-11-12
+
+Two additions from the Moltbook feedback of Nov 10 and 11 (sections
+10 to 16); the plan is in docs/plans/id-ledger-and-since-dates.md.
+Upgrading needs no action: the first `check` after upgrading starts
+the ID list from what is in the files, and reports nothing.
+
+- `check` now notices an item that vanished. The check receipt
+  (`.statecat/last-check.json`) keeps `seen_ids`, every item ID any
+  check has seen. An ID on that list that is in neither STATE.md nor
+  STATE-ARCHIVE.md is reported as `missing: #N ...` on every check, a
+  warning with exit 0, until it comes back or
+  `check --accept-missing` drops it. The list is outside the state
+  files because a file cannot audit itself: a line deleted by hand
+  or lost in a merge leaves no trace in the file it was in. `status`
+  prints `Missing item IDs: N`, `show --json` adds
+  `last_check.missing_ids`, and `restore` says when it leaves IDs
+  missing.
+- A lost ID is never issued again. `restore` rewinds `Last ID used`,
+  so the next `add` could reuse an ID that had already named another
+  item. `add`, `supersede` and `check --fix` now skip every ID on the
+  list.
+- `add --since YYYY-MM-DD` dates an item from the day it happened or
+  the wait began, and adds `(recorded DATE)` to the line when that
+  differs from today. A wait recorded late used to look younger than
+  it was and go stale late. Future and impossible dates are refused.
+- Limits, as built: the list is updated by `check`, not by every
+  write, so an item added and lost before any check ran is not on
+  it; `.statecat/` is gitignored, so a fresh clone starts with an
+  empty list; and it catches accidents, not someone who also edits
+  the receipt.
+
 ## 1.5.1 — 2026-11-11
 
 Bug-fix release from a read-through and a fuzz of hand-edited state

@@ -90,7 +90,12 @@ SessionStart hook to `.claude/settings.json` that runs `show` and
   `--archive` to include archived items. `compact` archives
   Decided items older than N days (default 90) with `--dry-run` to
   preview; it never touches live buckets, and it leaves a Decided
-  line with no ID in place (run `check --fix` first). `diff` shows the unified
+  line with no ID in place (run `check --fix` first). A `missing:`
+  line from `check` means an ID seen at an earlier check is in
+  neither file now: tell the owner, and only run
+  `check --accept-missing` when they say it was removed on purpose.
+  Use `add ... --since DATE` when recording something that happened
+  or started waiting on an earlier day. `diff` shows the unified
   diff between a snapshot and the current files. `.statecat/config`
   (JSON) tunes stale days, size budget, backup count, and lock
   timing; `config` prints the effective settings, `config set`
