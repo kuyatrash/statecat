@@ -351,6 +351,12 @@ from today; past dates are rejected). `[review YYYY-MM-DD]` must be
 the last thing on the item's first line; anywhere else it is just
 text. The leading date stays the day the wait started.
 
+When you record something late, `add ... --since 2026-11-01` dates
+the item from the day it happened or the wait began, and adds
+`(recorded 2026-11-12)` to the line, so a late entry does not look
+younger than it is. Future dates are rejected. It works in any
+bucket.
+
 On or after its review date, `check` reports the item as `due:`
 (a warning, never a structural problem, and never a prompt to
 chase it). Then do one of three things: `move` it out (resolved),
@@ -379,6 +385,27 @@ was checked. It records that the files passed the structural
 check at that time, not that their entries are still true. If the
 receipt cannot be written, `check` prints a note and keeps its
 normal result. `status` and `show` never write it.
+
+### Items that go missing
+
+The same receipt keeps a list of every item ID a check has seen. It
+lives outside the state files on purpose: if a line is deleted by
+hand, lost in a merge, or dropped by a `restore`, the files
+themselves cannot say it was ever there. `check` reports such an ID
+on every run:
+
+```
+missing: #12 was in the state files at an earlier check and is now in neither STATE.md nor STATE-ARCHIVE.md; restore it, or run check --accept-missing if it was removed on purpose
+```
+
+It is a warning, not an error. `check --accept-missing` stops the
+report for a line you removed on purpose. Either way the ID is never
+issued again, even after `restore` rewinds `Last ID used`. Archiving,
+superseding and moving never trigger it. The list is updated by
+`check`, so an item added and lost before any check ran is not on
+it, and a fresh clone (`.statecat/` is gitignored) starts with an
+empty list. It catches accidents, not someone who also edits the
+receipt.
 
 ## Configuration
 

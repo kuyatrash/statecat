@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StateCat v1.5.1: one living project state, readable by any agent in one read.
+"""StateCat v1.5.5: one living project state, readable by any agent in one read.
 
 This is a single, dependency-free Python script (Python 3.8+, UTF-8).
 It makes no network calls and sends nothing anywhere. All data stays
@@ -61,6 +61,11 @@ Rules implemented here (StateCat scope, revision 5):
 - Every `check` overwrites .statecat/last-check.json (time,
   result, sha256 of both files), which `status` reports as an age.
   It records a structural check, not that the entries are true.
+- The same receipt keeps every item ID a check has ever seen. An ID
+  on that list that is in neither file any more is reported as
+  missing until it comes back or `check --accept-missing` drops it,
+  and it is never issued again. The list lives outside the state
+  files on purpose: a file cannot audit itself.
 - Every write is backed up first as a paired snapshot of both
   files. Two-file writes (supersede, archive) write the archive
   first, then STATE.md, each file atomically (temp file, then
@@ -93,7 +98,7 @@ from datetime import date, timedelta
 # most commands (show, search, pointer) need none of the four. shutil
 # stays here: argparse imports it anyway while the parser is built.
 
-VERSION = "1.5.1"
+VERSION = "1.5.5"
 
 STATE = "STATE.md"
 ARCHIVE = "STATE-ARCHIVE.md"
@@ -438,9 +443,11 @@ class StateFile:
                 return item
         return None
 
-    def next_id(self, other):
-        """Next global ID: Last ID used + 1, skipping any ID in use."""
-        used = set(self.all_ids()) | set(other.all_ids())
+    def next_id(self, other, reserved=()):
+        """Next global ID: Last ID used + 1, skipping any ID in use
+        and any ID in `reserved` (IDs an earlier check saw, which may
+        have been lost from the files since)."""
+        used = set(self.all_ids()) | set(other.all_ids()) | set(reserved)
         candidate = (self.last_id or 0) + 1
         while candidate in used:
             candidate += 1
@@ -820,6 +827,17 @@ def warnings_for(state, archive, directory=None):
                 "stale: %s in Waiting on others is %d days old "
                 "(not a prompt to chase)"
                 % (id_label(item), age)
+            )
+    # IDs an earlier check saw that are now in neither file. The list
+    # is kept outside the state files (in the check receipt), so a
+    # line deleted by hand or lost in a bad merge cannot hide itself.
+    if directory:
+        for item_id in missing_ids(directory, state, archive):
+            warnings.append(
+                "missing: #%d was in the state files at an earlier check and is "
+                "now in neither %s nor %s; restore it, or run check "
+                "--accept-missing if it was removed on purpose"
+                % (item_id, STATE, ARCHIVE)
             )
     return warnings
 
@@ -2873,7 +2891,7 @@ def item_to_dict(item, parsed=None):
 
 def cmd_show(args):
     directory = require_root()
-    state, _archive = read_state_and_archive(directory)
+    state, archive = read_state_and_archive(directory)
     if getattr(args, "json", False):
         buckets = [args.bucket] if args.bucket else list(BUCKETS)
         if args.bucket:
@@ -2885,7 +2903,7 @@ def cmd_show(args):
         data = {
             "project": project_name(state),
             "last_id": state.last_id,
-            "last_check": check_receipt_json(directory),
+            "last_check": check_receipt_json(directory, state, archive),
             "buckets": {
                 bucket: [item_to_dict(item, state) for item in state.items if item.bucket == bucket]
                 for bucket in buckets
@@ -2917,6 +2935,7 @@ def cmd_status(args):
     warnings = warnings_for(state, archive, directory)
     stale = [warning for warning in warnings if warning.startswith("stale:")]
     due = [warning for warning in warnings if warning.startswith("due:")]
+    missing = [warning for warning in warnings if warning.startswith("missing:")]
     receipt = read_check_receipt(directory)
     counts = {bucket: 0 for bucket in BUCKETS}
     for item in state.items:
@@ -2929,6 +2948,8 @@ def cmd_status(args):
         print("Waiting items due for review: %d" % len(due))
     if stale:
         print("Stale waiting items: %d" % len(stale))
+    if missing:
+        print("Missing item IDs: %d" % len(missing))
     longest = None
     for item in state.items:
         if item.bucket in WAITING_BUCKETS and item.item_id is not None:
@@ -3087,6 +3108,19 @@ def parse_review_arg(text):
     return raw
 
 
+def parse_since_arg(text):
+    """An --since value as a YYYY-MM-DD string: a real calendar date
+    that is not in the future."""
+    raw = (text or "").strip()
+    if not re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", raw) or not _valid_date(raw):
+        sys.stderr.write("error: --since must be a date like 2026-11-03 (got %r)\n" % text)
+        sys.exit(1)
+    if raw > today_str():
+        sys.stderr.write("error: --since date %s is in the future\n" % raw)
+        sys.exit(1)
+    return raw
+
+
 def waiting_options_or_fail(args, bucket):
     """Validate --review and --resolves-when for a target bucket.
     Returns (review date or None, resolves-when text or None)."""
@@ -3123,20 +3157,28 @@ def cmd_add(args):
     if args.because:
         reject_newlines(args.because, "because text")
     review, resolves_when = waiting_options_or_fail(args, bucket)
+    since = getattr(args, "since", None)
+    if since is not None:
+        since = parse_since_arg(since)
     text = args.text
     if args.because:
         text = "%s, because %s" % (text, args.because)
     if resolves_when:
         text = "%s, resolves when %s" % (text, resolves_when)
+    if since is not None and since != today_str():
+        # Two dates, kept apart: the item's own date is when the thing
+        # happened or the wait began, and this says when it was written
+        # down, so a late entry does not pass for an early one.
+        text = "%s (recorded %s)" % (text, today_str())
     if review:
         if review_marker(text)[1] is not None:
             sys.stderr.write("error: item text already ends with a [review ...] date; drop it or drop --review\n")
             return 1
         text = with_review(text, review)
-    new_id = state.next_id(archive)
+    new_id = state.next_id(archive, ledger_ids(directory))
     take_snapshot(directory, "pre-write")
     state.set_last_id(new_id)
-    line = "- #%d [%s] %s" % (new_id, today_str(), text)
+    line = "- #%d [%s] %s" % (new_id, since or today_str(), text)
     insert_into_bucket(state, bucket, line)
     atomic_write(os.path.join(directory, STATE), state.lines)
     print("added #%d" % new_id)
@@ -3349,7 +3391,7 @@ def cmd_supersede(args):
     reject_newlines(args.text, "item text")
     if args.because:
         reject_newlines(args.because, "because text")
-    new_id = state.next_id(archive)
+    new_id = state.next_id(archive, ledger_ids(directory))
     old_content = item.content
     old_ending = item.ending
     new_text = "%s (supersedes #%d)" % (args.text, item_id)
@@ -3551,17 +3593,62 @@ def describe_check_receipt(directory, receipt):
     return "Last check: %s, %s, %s, %s" % (when.strftime("%Y-%m-%d %H:%M"), result, age, since)
 
 
-def check_receipt_json(directory):
-    """The receipt for show --json, with files_changed_since added."""
+def check_receipt_json(directory, state, archive):
+    """The receipt for show --json, with files_changed_since added.
+    The full list of seen IDs is left out; missing_ids is what a
+    reader needs from it."""
     receipt = read_check_receipt(directory)
     if receipt is None:
         return None
     data = dict(receipt)
+    data.pop("seen_ids", None)
     data["files_changed_since"] = bool(receipt_changed_files(directory, receipt))
+    data["missing_ids"] = missing_ids(directory, state, archive)
     return data
 
 
-def write_check_receipt(directory, problems, warnings, last_id):
+def present_ids(state, archive):
+    """Every item ID in STATE.md or STATE-ARCHIVE.md right now."""
+    return set(state.all_ids()) | set(archive.all_ids())
+
+
+def ledger_ids(directory):
+    """Every item ID a check has seen in this project, from the check
+    receipt. Empty when there is no receipt or it has no usable list:
+    a missing ledger means nothing is known, never that IDs are lost."""
+    receipt = read_check_receipt(directory)
+    seen = receipt.get("seen_ids") if receipt else None
+    if not isinstance(seen, list):
+        return set()
+    return {
+        value for value in seen
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    }
+
+
+def missing_ids(directory, state, archive):
+    """IDs an earlier check saw that are in neither file now, sorted."""
+    return sorted(ledger_ids(directory) - present_ids(state, archive))
+
+
+def accept_missing_ids(directory, state, archive):
+    """Drop missing IDs from the ledger, for items removed on purpose.
+    Returns the IDs dropped. They stay retired: the Last ID used
+    counter is already past them."""
+    gone = missing_ids(directory, state, archive)
+    receipt = read_check_receipt(directory)
+    if not gone or receipt is None:
+        return gone
+    receipt["seen_ids"] = sorted(present_ids(state, archive))
+    path = os.path.join(directory, CHECK_RECEIPT)
+    try:
+        atomic_write_bytes(path, (json.dumps(receipt, indent=2) + "\n").encode("utf-8"))
+    except OSError as exc:
+        fail_cleanly("could not update %s (%s)" % (CHECK_RECEIPT, exc.strerror or exc))
+    return gone
+
+
+def write_check_receipt(directory, problems, warnings, state, archive):
     """Record this check in .statecat/last-check.json, overwriting the
     previous one. It records that the files passed (or failed) the
     structural check at this time, not that their entries are true.
@@ -3580,8 +3667,11 @@ def write_check_receipt(directory, problems, warnings, last_id):
         "warnings": len(warnings),
         "state_sha256": _file_sha256(os.path.join(directory, STATE)),
         "archive_sha256": _file_sha256(os.path.join(directory, ARCHIVE)),
-        "last_id": last_id,
+        "last_id": state.last_id,
         "version": VERSION,
+        # Every ID any check has seen: the earlier list plus what is
+        # in the files now. It only shrinks through --accept-missing.
+        "seen_ids": sorted(ledger_ids(directory) | present_ids(state, archive)),
     }
     path = os.path.join(directory, CHECK_RECEIPT)
     try:
@@ -3597,6 +3687,15 @@ def write_check_receipt(directory, problems, warnings, last_id):
 def cmd_check(args):
     directory = require_root()
     state, archive = read_state_and_archive(directory)
+    if getattr(args, "accept_missing", False):
+        accepted = accept_missing_ids(directory, state, archive)
+        if accepted:
+            print(
+                "accepted %d missing item ID(s): %s"
+                % (len(accepted), ", ".join("#%d" % item_id for item_id in accepted))
+            )
+        else:
+            print("no missing item IDs to accept")
     problems = structural_problems(state, archive)
     warnings = warnings_for(state, archive, directory)
     for problem in problems:
@@ -3618,7 +3717,7 @@ def cmd_check(args):
         for item in list(state.items):
             changed = False
             if item.item_id is None:
-                new_id = state.next_id(archive)
+                new_id = state.next_id(archive, ledger_ids(directory))
                 item.item_id = new_id
                 state.set_last_id(new_id)
                 changed = True
@@ -3660,10 +3759,11 @@ def cmd_check(args):
             directory,
             structural_problems(state, archive),
             warnings_for(state, archive, directory),
-            state.last_id,
+            state,
+            archive,
         )
         return 0
-    write_check_receipt(directory, problems, warnings, state.last_id)
+    write_check_receipt(directory, problems, warnings, state, archive)
     if problems:
         print("check: %d structural problem(s)" % len(problems))
         return 1
@@ -3807,6 +3907,13 @@ def cmd_restore(args):
         print("warning: restored files have structural problems:")
         for problem in problems:
             print("problem: %s" % problem)
+    gone = missing_ids(directory, state, archive)
+    if gone:
+        print(
+            "note: %d item ID(s) seen at an earlier check are not in the restored "
+            "files; check reports them until you run check --accept-missing"
+            % len(gone)
+        )
     return 0
 
 
@@ -3865,7 +3972,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="statecat",
         description=(
-            "StateCat v1.5.1: one living project state, readable by any agent "
+            "StateCat v1.5.5: one living project state, readable by any agent "
             "in one read. Local only, plain Markdown, no network calls."
         ),
     )
@@ -3910,6 +4017,7 @@ def build_parser():
     p.add_argument("--because", help="Rationale, appended as ', because ...'")
     p.add_argument("--resolves-when", dest="resolves_when", help="Waiting items: what resolves it, appended as ', resolves when ...'")
     p.add_argument("--review", help="Waiting items: when to look again, YYYY-MM-DD or Nd (days from today)")
+    p.add_argument("--since", help="Date it happened or the wait began (YYYY-MM-DD, not in the future), when you record it later; the line also says when it was recorded")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("move", help="Move an item to another bucket by ID")
@@ -3957,6 +4065,8 @@ def build_parser():
     p = sub.add_parser("check", help="Report structural problems and warnings")
     p.add_argument("--fix", action="store_true", help="Assign missing IDs and starred dates (Parked-guard exempt)")
     p.add_argument("--fix-ids", dest="fix_ids", action="store_true", help="Alias for --fix")
+    p.add_argument("--accept-missing", dest="accept_missing", action="store_true",
+                   help="Stop reporting IDs that an earlier check saw and that were removed on purpose")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("restore", help="Restore a paired snapshot of both files")
