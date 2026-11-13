@@ -227,7 +227,9 @@ is calling it, and a hand edit bypasses it entirely.
   stale cleanup. A genuinely own directory left behind
   strands the project until it ages past ten times the
   stale limit.
-  Read-only commands do not take the lock.
+  Read-only commands that read the state files (show, status,
+  search, check, diff) take the lock too, so they never see a
+  half-written pair; they may wait briefly for a writer.
 
 ## Manual rules: no CLI available
 
