@@ -259,8 +259,10 @@ archive file, or recreate it from `templates/STATE-ARCHIVE.md`.
 The CLI never reformats lines it is not changing, so your hand
 edits survive. Files are opened with `newline=""`, so line
 endings are preserved byte-for-byte, including on Windows.
-State files are written with mode 0644 (world-readable), so
-other user or agent accounts on the same machine can read them.
+A rewrite keeps the file's existing permission bits, so a 0600
+state file stays 0600. A new file gets the mode your umask allows
+(0644 with the usual 022 umask, readable by other user or agent
+accounts on the same machine).
 
 ## Un-parking with owner approval
 
@@ -475,11 +477,16 @@ when the lock is under a second from clearing, the error says it
 should clear on the next attempt instead of "in about 0 seconds".
 A lock left behind by a crashed process is broken after 60 seconds.
 The lock carries a random owner token. Release and stale removal
-never check-then-delete in place: they rename the lock directory
-aside first (atomic), verify the token or the age on the renamed
-copy, and only delete it when the copy is still theirs or still
-stale. A copy that belongs to someone else, or is fresh, is put
-back if the lock path is free, and never deleted. A stale lock
+check the lock in place first, while it is still at its path
+(release: is the token ours; stale removal: is the owner proved
+dead), and only then rename it aside (atomic) and delete the
+renamed copy if it is still the directory they checked. A lock
+that is not theirs, or not proved abandoned, is never moved. The
+check and the rename run under an OS lock on
+`.statecat/lock.break`, so two breakers, or a breaker and a
+release, cannot interleave. A renamed copy that turns out not to
+be the checked directory is put back if the lock path is free,
+and never deleted. A stale lock
 is only broken when its directory is old *and* its owner is
 proved dead: the owner PID recorded in the lock's owner file is
 checked, and a live owner is never deleted, however old the
@@ -502,8 +509,11 @@ stated honestly: the existence check before a restore and
 the rename itself are two steps, so a lock directory created
 in exactly that window could still be replaced on POSIX; a
 PID recorded in the owner file can be reused by an unrelated
-process after the owner dies, and that strands the lock --
-the liveness check reports the reused PID as alive, so the
+process after the owner dies. On Linux the owner file also
+records the owner's process start time, and a different start
+time for the process now holding that PID proves the PID was
+reused, so the lock is broken. Elsewhere a reused PID strands
+the lock -- the liveness check reports it as alive, so the
 lock is treated as live until that process exits, and the
 heartbeat does not fix it, because the original owner's
 heartbeat died with it. On Windows the liveness check is never
@@ -525,7 +535,11 @@ checkouts); the suite now skips or expects Windows behaviour
 for those, and the Windows job sets `fail-fast: false` so one
 version's failure does not cancel the other.
 Read-only commands (`show`, `check` without `--fix`, `search`,
-`status`, `diff`) do not take the lock.
+`status`, `diff`) take the lock too, so they never see the
+half-finished pair between the two writes of a supersede,
+archive or compact; they may wait briefly for a writer to
+finish. `pointer` with no flag, `config` without `set`, and
+`restore --list` read neither state file and stay unlocked.
 
 ## What StateCat is not
 

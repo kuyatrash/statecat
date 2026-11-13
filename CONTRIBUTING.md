@@ -30,8 +30,9 @@ hard enforcement.
   re-wrap, or reorder lines a command did not change.
 - Every write takes a paired snapshot of both files first, and writes
   are atomic (temp file + rename).
-- Write commands run under the project lock. Read-only commands do
-  not take it.
+- Write commands run under the project lock. Read-only commands that
+  read the state files (show, status, search, check, diff) take it
+  too, so they never see a half-written pair.
 - Keep output banner-free and plain, one result per line, so agents
   can parse it. `show --json` is the machine-readable path.
 - Update README.md and SKILL.md when a command changes, and add a

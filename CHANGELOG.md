@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Bug fixes from a read-through and a fuzz of hand-edited state files.
+Upgrading needs no action.
+
+- `restore` of the oldest snapshot no longer crashes or loses that
+  snapshot. At the `backups_kept` limit (20 by default), the safety
+  snapshot taken before the restore pruned the oldest snapshot,
+  which was the one being restored, so restore failed with a
+  FileNotFoundError traceback and the snapshot was gone. The target
+  is now read before the safety snapshot is taken.
+- A "Last ID used" line whose value is not a number (for example
+  `> Last ID used: none`) is now repaired in place. `add`,
+  `supersede` and `check --fix` used to leave it and insert a second
+  "Last ID used" line below it, and `check` said "line is missing".
+  `check` now names the line and says it is not a number.
+- Docs: README, SKILL.md and CONTRIBUTING.md said read-only commands
+  do not take the lock; `show`, `status`, `search`, `check` and
+  `diff` do take it. README said state files are always
+  written with mode 0644; a rewrite keeps the file's own bits and a
+  new file follows the umask. README's lock section described the
+  old rename-first release and said a reused PID always strands the
+  lock; it now describes the check-in-place order and the Linux
+  start-time check.
+
 ## 1.5.5 — 2026-11-12
 
 Two additions from the Moltbook feedback of Nov 10 and 11 (sections
