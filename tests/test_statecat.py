@@ -3973,6 +3973,58 @@ class StateCatTest(unittest.TestCase):
         self.assertEqual(read_bytes(state_path(self.dir)), before)
         self.assertIn("no snapshots", run_cli(self.dir, "restore", "--list").stdout)
 
+    # Restoring the oldest snapshot at the backup limit: the safety
+    # snapshot taken before the restore pruned the very snapshot being
+    # restored, so restore crashed with FileNotFoundError and that
+    # snapshot was gone for good.
+    def test_restore_oldest_snapshot_at_the_backup_limit(self):
+        self.init_project()
+        self.assertEqual(run_cli(self.dir, "config", "set", "backups_kept", "3").returncode, 0)
+        for index in range(4):
+            run_cli(self.dir, "add", "Open", "Item %d" % index)
+        names = self.snapshot_names()
+        self.assertEqual(len(names), 3)
+        oldest = names[0]
+        expected_state = read_bytes(os.path.join(self.dir, ".statecat", "backups", oldest, "STATE.md"))
+        expected_archive = read_bytes(os.path.join(self.dir, ".statecat", "backups", oldest, "STATE-ARCHIVE.md"))
+        result = run_cli(self.dir, "restore", oldest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("restored %s" % oldest, result.stdout)
+        self.assertEqual(read_bytes(state_path(self.dir)), expected_state)
+        self.assertEqual(read_bytes(archive_path(self.dir)), expected_archive)
+
+    # A "Last ID used" line whose value is not a number was ignored,
+    # so add and check --fix inserted a second "Last ID used" line
+    # below it instead of repairing it, and check still said clean.
+    def test_malformed_last_id_line_is_repaired_in_place(self):
+        self.init_project()
+        path = state_path(self.dir)
+        text = read_text(path).replace("> Last ID used: #0", "> Last ID used: none")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "add", "Open", "One")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        last_id_lines = [line for line in read_text(path).splitlines() if line.startswith("> Last ID used:")]
+        self.assertEqual(last_id_lines, ["> Last ID used: #1"])
+
+    def test_check_fix_repairs_a_malformed_last_id_line_in_place(self):
+        self.init_project()
+        run_cli(self.dir, "add", "Open", "One")
+        run_cli(self.dir, "add", "Open", "Two")
+        path = state_path(self.dir)
+        text = read_text(path).replace("> Last ID used: #2", "> Last ID used: #two")
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result = run_cli(self.dir, "check")
+        self.assertIn("Last ID used on line 5 of STATE.md is not a number", result.stdout)
+        self.assertNotIn("line is missing", result.stdout)
+        result = run_cli(self.dir, "check", "--fix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fixed Last ID used to #2", result.stdout)
+        last_id_lines = [line for line in read_text(path).splitlines() if line.startswith("> Last ID used:")]
+        self.assertEqual(last_id_lines, ["> Last ID used: #2"])
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)

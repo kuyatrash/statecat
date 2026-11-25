@@ -338,6 +338,9 @@ class StateFile:
         self.stray_items = []  # list of (line_index, content): item-like lines outside any bucket
         self.duplicate_headings = []  # list of (line_index, heading)
         self.duplicate_last_id = []  # list of line_index: extra "> Last ID used:" lines
+        # First "> Last ID used:" line whose value is not a number:
+        # set_last_id rewrites it in place instead of adding a second.
+        self.malformed_last_id_index = None
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -383,6 +386,8 @@ class StateFile:
                 if value is not None:
                     self.last_id = value
                     self.last_id_index = index
+                elif self.malformed_last_id_index is None:
+                    self.malformed_last_id_index = index
                 continue
             if content.startswith("## "):
                 heading = content[3:].strip()
@@ -455,6 +460,10 @@ class StateFile:
 
     def set_last_id(self, value):
         """Update the Last ID used line in place, or insert it."""
+        if self.last_id_index is None and self.malformed_last_id_index is not None:
+            # A "Last ID used" line is there but unreadable: repair
+            # that line rather than adding a second one below it.
+            self.last_id_index = self.malformed_last_id_index
         if self.last_id_index is not None:
             content = "> Last ID used: #%d" % value
             self.lines[self.last_id_index][0] = content
@@ -685,7 +694,13 @@ def warnings_for(state, archive, directory=None):
     """Return a list of warning strings (never blocking)."""
     config = load_config(directory) if directory else dict(DEFAULT_CONFIG)
     warnings = []
-    if state.last_id is None:
+    if state.last_id is None and state.malformed_last_id_index is not None:
+        warnings.append(
+            "warning: Last ID used on line %d of %s is not a number like #12; "
+            "run check --fix to repair it"
+            % (state.malformed_last_id_index + 1, STATE)
+        )
+    elif state.last_id is None:
         warnings.append("warning: Last ID used line is missing in %s" % STATE)
     else:
         highest = 0
@@ -3890,12 +3905,15 @@ def cmd_restore(args):
         target_name, _kind, target_path = pre_write[-1]
     if not snapshot_is_complete(target_path, target_name):
         return 1
-    # Safety snapshot first; it is never the default target.
-    take_snapshot(directory, "safety")
+    # Read the target before the safety snapshot: taking it prunes
+    # the oldest snapshots, and at the backups_kept limit the oldest
+    # one can be the very snapshot being restored.
     data_by_filename = []
     for filename in (STATE, ARCHIVE):
         with open(os.path.join(target_path, filename), "rb") as handle:
             data_by_filename.append((filename, handle.read()))
+    # Safety snapshot next; it is never the default target.
+    take_snapshot(directory, "safety")
     atomic_write_pair(directory, data_by_filename)
     print("restored %s" % target_name)
     # Verify what was restored: a snapshot can itself carry structural
